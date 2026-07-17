@@ -10,7 +10,7 @@ Script file: `migrate-infopath-xml-to-list-pnp.ps1`
 
 At a high level, the script:
 
-1. Connects to SharePoint Online using app-only auth (certificate or client secret).
+1. Connects to SharePoint Online using app-only auth (certificate).
 2. Reads source items from the source list/library.
 3. Resolves XML payloads per source item:
    - If source item is an `.xml` file in a library, reads file content directly.
