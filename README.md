@@ -70,7 +70,6 @@ Parameters used:
 - `-Thumbprint`
 - `-CertStore` (`LocalMachine` or `CurrentUser`)
 
-## Client Secret
 
 Parameters used:
 
