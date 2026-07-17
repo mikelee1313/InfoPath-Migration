@@ -60,7 +60,7 @@ The script expects legacy data where InfoPath XML exists either:
 
 ## Authentication Options
 
-## Certificate (recommended)
+## Certificate (Required)
 
 Parameters used:
 
