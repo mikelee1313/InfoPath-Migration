@@ -77,12 +77,7 @@ Parameters used:
 - `-AuthType ClientSecret`
 - `-TenantId`
 - `-ClientId`
-- `-ClientSecret`
-
-You can also use environment variable:
-
-```powershell
-$env:PNP_CLIENT_SECRET = 'your-secret'
+  
 ```
 
 ## Parameters
