@@ -27,6 +27,7 @@
 
   Author: Mike Lee
   Created: 7/17/2026
+  Updated: 7/21/2026 - Added duplicate detection and handling, logging, and throttling support.
   
 #>
 
