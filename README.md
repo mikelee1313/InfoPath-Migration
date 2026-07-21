@@ -1,244 +1,250 @@
 # InfoPath XML to SharePoint List Migration (PnP App-Only)
 
-Migrate legacy InfoPath XML-based records from a source SharePoint list/library into a modern target SharePoint list using **PnP.PowerShell** and **app-only authentication**.
-
-This solution is designed for scenarios where InfoPath is retired/disabled, and historical XML form data plus embedded attachments must be preserved in a new OOTB list.
-
-## What This Script Does
+Migrate legacy InfoPath XML records from a source SharePoint list/library into a modern target SharePoint list using PnP.PowerShell and app-only authentication.
 
 Script file: `migrate-infopath-xml-to-list-pnp.ps1`
 
-At a high level, the script:
+This README reflects the current script behavior, including advanced duplicate detection, full-item replace mode, professional run logging, and large-run performance improvements.
 
-1. Connects to SharePoint Online using app-only auth (certificate).
-2. Reads source items from the source list/library.
-3. Resolves XML payloads per source item:
-   - If source item is an `.xml` file in a library, reads file content directly.
-   - If source is a classic list item, checks item attachment collection for XML.
-4. Parses InfoPath XML metadata into key/value pairs.
-5. Auto-provisions missing target columns (Text columns) for XML keys not present in target.
-6. Creates target list items and maps metadata values to target fields.
-7. Extracts embedded InfoPath attachments from XML base64 payloads and uploads them to the newly created target item.
-8. Outputs summary statistics (processed/resolved/created/uploaded/skipped/failed).
+## What the Script Does
 
-## Key Behaviors
+1. Connects to source and target SharePoint contexts (can be different sites).
+2. Reads source items and resolves InfoPath XML payloads.
+3. Parses XML metadata from InfoPath namespace leaf nodes.
+4. Optionally auto-creates missing target columns (Text type).
+5. Maps metadata into target field values with sanitization.
+6. Extracts embedded InfoPath attachments from base64 payloads.
+7. Handles duplicates via configurable action and detection strategy.
+8. Creates or replaces target items, uploads attachments, and logs a structured run summary.
 
-- **Cross-site support**: source and target can be on different site collections.
-- **URL-aware list input**: source/target can be provided as list title, list GUID, or list URL.
-- **Automatic retries**: transient throttling/server errors (429/502/503/504) use exponential backoff.
-- **Non-interactive execution**: avoids interactive prompts in list attachment resolution.
-- **Namespace filtering**: metadata mapping only uses InfoPath `my` namespace nodes to avoid junk columns like `div`, `a`, `br`.
-- **Value sanitization**: strips invalid control characters and normalizes text-field values to reduce `Invalid text value` errors.
+## Major Features
+
+- App-only auth with Certificate (required).
+- Source/target input as list title, GUID, or full URL.
+- Cross-site migration support.
+- Duplicate actions: `Skip`, `Overwrite`, `CreateNew`.
+- Duplicate detection modes:
+  - `Title`
+  - `MetadataAndAttachments` (mapped metadata + attachment file names)
+- Overwrite behavior is full replacement (delete old item, create new item).
+- Detailed start and end summary blocks in console and log file.
+- Robust retry logic for throttling and transient failures.
+- Optimized indexing for larger lists (in-memory duplicate indexes).
 
 ## Prerequisites
 
-## 1) PowerShell Module
-
-Install PnP.PowerShell:
+### 1) PowerShell Module
 
 ```powershell
 Install-Module PnP.PowerShell -Scope CurrentUser
 ```
 
-## 2) Entra ID App Registration
+### 2) Entra ID App Registration
 
-Configure an app registration for app-only access to SharePoint Online.
-
-Minimum expectations:
-
-- SharePoint application permissions appropriate for read/write list + attachments operations.
+- SharePoint application permissions for list read/write and attachments.
 - Admin consent granted.
-- If using certificate auth: certificate is installed in local cert store and private key available.
-- If using client secret auth: secret stored securely (environment variable recommended).
+- Certificate available for certificate auth.
 
-## 3) Source Data Shape
+Note:
 
-The script expects legacy data where InfoPath XML exists either:
+- Certificate auth is required for this migration scenario.
+- Client secret auth is not supported for this script when calling PnP/SharePoint APIs.
 
-- as XML files in a source document library, or
-- as XML attachments on classic list items.
+### 3) Source Content Shape
 
-## Authentication Options
+The script supports InfoPath XML from:
 
-## Certificate (Required)
-
-Parameters used:
-
-- `-AuthType Certificate`
-- `-TenantId`
-- `-ClientId`
-- `-Thumbprint`
-- `-CertStore` (`LocalMachine` or `CurrentUser`)
-
-
-Parameters used:
-
-- `-AuthType ClientSecret`
-- `-TenantId`
-- `-ClientId`
-  
-```
+- XML files in a document library, or
+- XML attachments on classic list items.
 
 ## Parameters
 
-The script currently includes defaults in the param block. Override at runtime as needed.
+### Connection and Auth
 
 - `SiteUrl` (string)
-  - Fallback site URL used when source/target list values are titles/IDs rather than URLs.
+  - Fallback site URL when list inputs are titles/GUIDs.
 - `SourceList` (string)
-  - Source list identity: title, GUID, or URL.
+  - Source list title, GUID, or URL.
 - `TargetList` (string)
-  - Target list identity: title, GUID, or URL.
+  - Target list title, GUID, or URL.
 - `TenantId` (string)
 - `ClientId` (string)
-- `AuthType` (`Certificate` | `ClientSecret`)
+- `AuthType` (`Certificate` required)
 - `Thumbprint` (string)
 - `CertStore` (`LocalMachine` | `CurrentUser`)
-- `ClientSecret` (string)
+- `ClientSecret` (string, present in script but not supported for this scenario)
+
+### Processing Controls
+
 - `PageSize` (int, default `200`)
-- `MaxItems` (int, default `0` meaning all)
+- `MaxItems` (int, default `0`, meaning all)
 - `TempFolder` (string)
 - `FallbackAttachmentName` (string)
+- `CreateMetadata` (bool)
+  - `true`: create missing target text columns.
+  - `false`: do not create missing columns, unmapped fields are skipped.
 - `SkipAttachments` (switch)
+  - If set, no attachment upload is attempted.
+
+### Duplicate Handling
+
+- `Duplicate` (`Overwrite` | `Skip` | `CreateNew`)
+  - `Skip`: do nothing when a match is found.
+  - `Overwrite`: replace matched item by deleting old and creating new.
+  - `CreateNew`: always create a new item.
+- `DuplicateDetection` (`Title` | `MetadataAndAttachments`)
+  - `Title`: matches by `Title` only.
+  - `MetadataAndAttachments`: matches by a generated signature from mapped metadata fields and attachment file names.
+
+### Logging
+
+- `EnableLogging` (bool)
+- `DebugLogging` (bool)
+- `LogFilePath` (string)
+
+## Duplicate Handling Matrix
+
+### `Duplicate = CreateNew`
+
+- Always creates a new target item.
+- Duplicate detection mode is ignored.
+
+### `Duplicate = Skip`
+
+- Finds a match using `DuplicateDetection`.
+- Skips source item when matched.
+
+### `Duplicate = Overwrite`
+
+- Finds a match using `DuplicateDetection`.
+- Replaces whole list item, not just attachments:
+  - remove existing target item
+  - create new target item from source metadata
+  - upload source attachments
+
+## Logging and Run Output
+
+The script writes:
+
+- A startup configuration block with run settings.
+- Per-item logs including source ID, create/replace result, title, and item IDs.
+- A completion summary block with totals and final status.
+
+If enabled, the same entries are written to `LogFilePath`.
+
+## Performance and Scale Notes
+
+For large lists (thousands of items), the script improves performance by:
+
+- Building an in-memory duplicate index once per run.
+- Precomputing source mapped values and attachments before target writes.
+
+When using `MetadataAndAttachments`, index creation is heavier than title mode because it reads target attachment names.
+
+## Throttling and Retry Behavior
+
+The script retries transient conditions including `429`, `502`, `503`, and `504`, plus throttle-like `403` cases.
+
+Retry wait uses:
+
+- `Retry-After`
+- `x-ms-retry-after-ms`
+- `RateLimit-Reset`
+- exponential backoff + jitter
 
 ## Usage Examples
 
-## 1) Run with script defaults
+### Certificate Auth
 
 ```powershell
-. 'C:\Users\michlee\OneDrive - Microsoft\SfMC_Docs\Customers\jefferies\InfoPath_export_to_List\migrate-infopath-xml-to-list-pnp.ps1'
-```
-
-## 2) Override key values explicitly
-
-```powershell
-.\migrate-infopath-xml-to-list-pnp.ps1 \
-  -SiteUrl 'https://contoso.sharepoint.com/sites/Main' \
-  -SourceList 'https://contoso.sharepoint.com/sites/Legacy/Shared%20Documents' \
-  -TargetList 'https://contoso.sharepoint.com/sites/Modern/Lists/Subscriptions' \
-  -TenantId 'tenant-guid' \
-  -ClientId 'app-guid' \
-  -AuthType Certificate \
-  -Thumbprint 'CERT_THUMBPRINT' \
+.\migrate-infopath-xml-to-list-pnp.ps1 `
+  -SiteUrl 'https://contoso.sharepoint.com/sites/Main' `
+  -SourceList 'https://contoso.sharepoint.com/sites/Legacy/Shared%20Documents' `
+  -TargetList 'https://contoso.sharepoint.com/sites/Modern/Lists/Subscriptions' `
+  -TenantId 'tenant-guid' `
+  -ClientId 'app-guid' `
+  -AuthType Certificate `
+  -Thumbprint 'CERT_THUMBPRINT' `
   -CertStore LocalMachine
 ```
 
-## 3) Client secret mode
+### Advanced Duplicate Detection + Skip
 
 ```powershell
-.\migrate-infopath-xml-to-list-pnp.ps1 \
-  -SiteUrl 'https://contoso.sharepoint.com/sites/Main' \
-  -SourceList 'LegacyList' \
-  -TargetList 'ModernList' \
-  -TenantId 'tenant-guid' \
-  -ClientId 'app-guid' \
-  -AuthType ClientSecret \
-  -ClientSecret $env:PNP_CLIENT_SECRET
+.\migrate-infopath-xml-to-list-pnp.ps1 `
+  -Duplicate Skip `
+  -DuplicateDetection MetadataAndAttachments
 ```
 
-## 4) Metadata-only migration (no attachment upload)
+### Advanced Duplicate Detection + Overwrite (Full Replace)
+
+```powershell
+.\migrate-infopath-xml-to-list-pnp.ps1 `
+  -Duplicate Overwrite `
+  -DuplicateDetection MetadataAndAttachments
+```
+
+### Do Not Auto-Create Metadata Columns
+
+```powershell
+.\migrate-infopath-xml-to-list-pnp.ps1 -CreateMetadata $false
+```
+
+### Metadata-Only (No Attachments)
 
 ```powershell
 .\migrate-infopath-xml-to-list-pnp.ps1 -SkipAttachments
 ```
 
-## 5) Test subset first
+### Small Test Batch
 
 ```powershell
 .\migrate-infopath-xml-to-list-pnp.ps1 -MaxItems 20
 ```
 
-## Migration Flow (Detailed)
+## Important Implementation Notes
 
-1. Resolve source and target contexts (`site + list identity`) from title/GUID/URL input.
-2. Connect to source site.
-3. Read source list items.
-4. For each source item:
-   - attempt XML resolution,
-   - parse XML document,
-   - queue successful payloads.
-5. Connect to target site.
-6. Read writable target fields.
-7. Parse all queued XML maps and collect all keys.
-8. Auto-create missing target columns as Text under group `InfoPath Migrated Columns`.
-9. Create target items with sanitized mapped values.
-10. Extract and upload embedded attachments.
-11. Print migration summary.
-
-## Important Notes About Field Creation
-
-- Missing XML keys are created as **single-line Text** fields by default.
-- Internal names are sanitized (`A-Z`, `a-z`, `0-9`, `_`) and length-limited.
-- Display name is the original XML key.
-
-If you need richer field typing (Date/Number/YesNo/Choice), extend field inference logic before creation.
+- Metadata column creation is Text-only today.
+- Text values are sanitized for control characters.
+- Single-line text fields are flattened and truncated to 255 chars.
+- Attachment duplicate matching in `MetadataAndAttachments` uses attachment file names, not file content hashes.
 
 ## Troubleshooting
 
-## "Supply values for the following parameters" during run
+### Many items are skipped with "no InfoPath XML found"
 
-Cause:
+Expected when source library contains non-XML artifacts.
 
-- Usually from a cmdlet call shape that triggers interactive prompting.
+### Invalid text value errors
 
-Current status:
+Some fields may require custom transforms (date/choice/boolean/lookup). Extend mapping logic as needed.
 
-- Script is hardened to avoid interactive attachment lookup behavior.
+### Duplicate matching appears too broad or too narrow
 
-## "Invalid text value"
+- Try switching `DuplicateDetection` mode.
+- Ensure key metadata fields are mapped into target values before duplicate comparison.
 
-Cause:
+### Throttling or long runtime
 
-- Input text contains unsupported control chars, long multiline payloads, or incompatible formatting for Text fields.
+- Lower `PageSize`.
+- Use `MaxItems` to process in batches.
 
-Mitigation in script:
+### Client secret auth fails
 
-- Control characters removed.
-- Text fields flattened to single-line and truncated to 255 chars.
+- Expected for this migration implementation.
+- Use certificate auth with `-AuthType Certificate`.
 
-If still occurring:
+## Recommended Run Strategy
 
-- Add field-specific conversions (for dates, choice, boolean, etc.).
+1. Start with `-MaxItems 20` in a test target list.
+2. Confirm metadata mappings and attachment outcomes.
+3. Choose duplicate strategy for production:
+   - Fast: `Title`
+   - Safer for repeated titles: `MetadataAndAttachments`
+4. Run full migration in monitored batches.
 
-## Many items show "Skipped: no InfoPath XML found"
-
-Expected when source library contains non-XML artifacts (folders/docs).
-
-- Only items with resolvable XML payload are migrated.
-
-## Wrong source/target list resolved
-
-Verify `SourceList` and `TargetList` values:
-
-- List title: `Subscriptions`
-- List URL: `https://tenant.sharepoint.com/sites/Site/Lists/Subscriptions`
-- Library URL: `https://tenant.sharepoint.com/sites/Site/Shared%20Documents`
-
-## Throttling/timeouts
-
-- Retry wrapper already handles transient HTTP codes with backoff.
-- Reduce `PageSize` or process in batches (`MaxItems`) if needed.
-
-## Safety and Execution Guidance
-
-- Run against a test target list first.
-- Start with small batch (`-MaxItems`) to validate mappings and attachment behavior.
-- Keep target list versioning enabled during migration.
-- Export source and target snapshots before large runs.
-
-## Suggested GitHub Enhancements
-
-- Add CSV/JSON migration log (source ID -> target ID -> status/error).
-- Add idempotency key (skip already migrated source IDs).
-- Add field type inference and configurable field mapping overrides.
-- Add cleanup helper for legacy auto-created fields.
-
-## Repository Structure (Current Folder)
+## Repository Contents
 
 - `migrate-infopath-xml-to-list-pnp.ps1` - main migration script
-- `export-infopath-to-list.ps1` - earlier local extraction helper
-- `*.xml` - sample InfoPath XML payloads
-
-## License / Ownership
-
-Update this section in your GitHub repo according to your preferred license and ownership model.
+- `export-infopath-to-list.ps1` - earlier helper script
+- `*.xml` - sample payload files
