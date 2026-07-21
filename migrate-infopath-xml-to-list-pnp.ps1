@@ -31,6 +31,7 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
+#region Parameters
 param(
   [Parameter()]
   [string]$SiteUrl= 'https://m365cpi13246019.sharepoint.com',
@@ -74,11 +75,39 @@ param(
   [string]$FallbackAttachmentName = 'uploadedFile.bin',
 
   [Parameter()]
+  [bool]$CreateMetadata = $true,
+
+  [Parameter()]
+  [ValidateSet('Overwrite', 'Skip', 'CreateNew')]
+  [string]$Duplicate = 'Skip',
+
+  [Parameter()]
+  [ValidateSet('Title', 'MetadataAndAttachments')]
+  [string]$DuplicateDetection = 'MetadataAndAttachments',
+
+  [Parameter()]
+  [bool]$EnableLogging = $true,
+
+  [Parameter()]
+  [bool]$DebugLogging = $false,
+
+  [Parameter()]
+  [string]$LogFilePath = (Join-Path $PSScriptRoot ("InfoPathMigration-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))),
+
+  [Parameter()]
   [switch]$SkipAttachments
 )
+#endregion Parameters
 
+#region Script Setup
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:RunLog = $null
+$script:LoggingEnabled = $false
+$script:DebugLoggingEnabled = $DebugLogging
+$script:runSucceeded = $false
+$script:runStartedUtc = [datetime]::UtcNow
 
 # Use explicit validation here to avoid interactive prompts caused by Mandatory parameters.
 $requiredParams = @{
@@ -110,20 +139,246 @@ $script:stats = [ordered]@{
   Skipped = 0
   Failed = 0
 }
+#endregion Script Setup
+
+#region Logging Helpers
+function Write-Log {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [AllowEmptyString()] [string]$Message,
+    [Parameter()] [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'DEBUG')] [string]$Level = 'INFO'
+  )
+
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  $entry = "$ts [$Level] $Message"
+
+  if ($script:LoggingEnabled -and -not [string]::IsNullOrWhiteSpace($script:RunLog)) {
+    try {
+      Add-Content -Path $script:RunLog -Value $entry -Encoding UTF8
+    }
+    catch {
+      Write-Host "Failed writing to log file '$($script:RunLog)': $($_.Exception.Message)" -ForegroundColor Red
+    }
+  }
+
+  switch ($Level) {
+    'SUCCESS' { Write-Host $Message -ForegroundColor Green }
+    'WARN' { Write-Host $Message -ForegroundColor Yellow }
+    'ERROR' { Write-Host $Message -ForegroundColor Red }
+    'DEBUG' {
+      if ($script:DebugLoggingEnabled) {
+        Write-Host $Message -ForegroundColor DarkGray
+      }
+    }
+    default { Write-Host $Message -ForegroundColor Cyan }
+  }
+}
 
 function Write-Info {
   param([string]$Message)
-  Write-Host $Message -ForegroundColor Cyan
+  Write-Log -Message $Message -Level INFO
 }
 
 function Write-Warn {
   param([string]$Message)
-  Write-Host $Message -ForegroundColor Yellow
+  Write-Log -Message $Message -Level WARN
 }
 
 function Write-Err {
   param([string]$Message)
-  Write-Host $Message -ForegroundColor Red
+  Write-Log -Message $Message -Level ERROR
+}
+
+function Get-DuplicateModeDescription {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [string]$Mode)
+
+  switch ($Mode.ToLowerInvariant()) {
+    'skip' { return 'If a matching item exists, skip source item.' }
+    'overwrite' { return 'If a matching item exists, replace existing target item with a new item from source.' }
+    'createnew' { return 'Always create a new target item.' }
+    default { return 'Unknown duplicate handling behavior.' }
+  }
+}
+
+function Get-DuplicateDetectionDescription {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [string]$Mode)
+
+  switch ($Mode.ToLowerInvariant()) {
+    'title' { return 'Duplicate match by Title only (fastest).' }
+    'metadataandattachments' { return 'Duplicate match by mapped metadata fields + attachment file names.' }
+    default { return 'Unknown duplicate detection mode.' }
+  }
+}
+
+function Normalize-DuplicateMode {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [string]$Mode)
+
+  switch ($Mode.ToLowerInvariant()) {
+    'skip' { return 'Skip' }
+    'overwrite' { return 'Overwrite' }
+    'createnew' { return 'CreateNew' }
+    default { return $Mode }
+  }
+}
+
+function Start-RunLogging {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [bool]$Enabled,
+    [Parameter(Mandatory)] [string]$Path
+  )
+
+  if (-not $Enabled) {
+    $script:LoggingEnabled = $false
+    Write-Host 'File logging is disabled for this run.' -ForegroundColor Yellow
+    return
+  }
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    $script:LoggingEnabled = $false
+    Write-Host 'LogFilePath is empty. File logging is disabled for this run.' -ForegroundColor Yellow
+    return
+  }
+
+  $script:RunLog = $Path
+  $script:LoggingEnabled = $true
+  $script:DebugLoggingEnabled = $DebugLogging
+
+  $logFolder = Split-Path -Path $script:RunLog -Parent
+  if (-not [string]::IsNullOrWhiteSpace($logFolder) -and -not (Test-Path -Path $logFolder -PathType Container)) {
+    New-Item -Path $logFolder -ItemType Directory -Force | Out-Null
+  }
+
+  try {
+    if (-not (Test-Path -Path $script:RunLog -PathType Leaf)) {
+      New-Item -Path $script:RunLog -ItemType File -Force | Out-Null
+    }
+
+    Write-Log -Message "Logging to file: $script:RunLog" -Level INFO
+    Write-Log -Message ('-' * 80) -Level INFO
+  }
+  catch {
+    $script:LoggingEnabled = $false
+    Write-Host "Could not initialize file logging at '$script:RunLog'. Continuing without file logging. Error: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Write-RunConfigurationSummary {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] $SourceContext,
+    [Parameter(Mandatory)] $TargetContext
+  )
+
+  $runId = [guid]::NewGuid().ToString('N').Substring(0, 8).ToUpperInvariant()
+  $startedLocal = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+  $separator = ('=' * 92)
+
+  Write-Info ''
+  Write-Info $separator
+  Write-Log -Level SUCCESS -Message 'INFO PATH MIGRATION - RUN CONFIGURATION'
+  Write-Info $separator
+  Write-Info ("  Run ID             : {0}" -f $runId)
+  Write-Info ("  Started            : {0}" -f $startedLocal)
+  Write-Info ("  Source             : {0} | {1}" -f $SourceContext.SiteUrl, $SourceContext.ListIdentity)
+  Write-Info ("  Target             : {0} | {1}" -f $TargetContext.SiteUrl, $TargetContext.ListIdentity)
+  Write-Info ("  AuthType           : {0}" -f $AuthType)
+  Write-Info ("  PageSize           : {0}" -f $PageSize)
+  Write-Info ("  MaxItems           : {0}" -f $MaxItems)
+  Write-Info ("  CreateMetadata     : {0}" -f $CreateMetadata)
+  Write-Info ("  Duplicate Mode     : {0}" -f $Duplicate)
+  Write-Info ("  Duplicate Action   : {0}" -f (Get-DuplicateModeDescription -Mode $Duplicate))
+  Write-Info ("  Duplicate Detect   : {0}" -f $DuplicateDetection)
+  Write-Info ("  Detect Description : {0}" -f (Get-DuplicateDetectionDescription -Mode $DuplicateDetection))
+  Write-Info ("  SkipAttachments    : {0}" -f $SkipAttachments)
+  Write-Info ("  EnableLogging      : {0}" -f $EnableLogging)
+  Write-Info ("  DebugLogging       : {0}" -f $DebugLogging)
+  if ($EnableLogging) {
+    Write-Info ("  LogFilePath        : {0}" -f $LogFilePath)
+  }
+  Write-Info $separator
+  Write-Info ''
+}
+#endregion Logging Helpers
+
+#region Throttling Helpers
+function Get-HeaderValue {
+  [CmdletBinding()]
+  param(
+    [Parameter()] $Headers,
+    [Parameter(Mandatory)] [string]$Name
+  )
+
+  if ($null -eq $Headers) { return $null }
+
+  try {
+    $value = $Headers[$Name]
+    if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+      return [string]$value
+    }
+  }
+  catch {}
+
+  return $null
+}
+
+function Get-ThrottleWaitSecondsFromHeaders {
+  [CmdletBinding()]
+  param(
+    [Parameter()] $Headers,
+    [Parameter()] [int]$DefaultSeconds = 1
+  )
+
+  $retryAfterSec = $null
+  $rateResetSec = $null
+
+  $retryAfter = Get-HeaderValue -Headers $Headers -Name 'Retry-After'
+  if (-not [string]::IsNullOrWhiteSpace($retryAfter)) {
+    $intVal = 0
+    if ([int]::TryParse($retryAfter, [ref]$intVal)) {
+      $retryAfterSec = [Math]::Max($intVal, 0)
+    }
+    else {
+      $dtVal = [datetime]::MinValue
+      if ([datetime]::TryParse($retryAfter, [ref]$dtVal)) {
+        $retryAfterSec = [Math]::Max([int][Math]::Ceiling(($dtVal.ToUniversalTime() - [datetime]::UtcNow).TotalSeconds), 0)
+      }
+    }
+  }
+
+  $retryAfterMs = Get-HeaderValue -Headers $Headers -Name 'x-ms-retry-after-ms'
+  if (-not [string]::IsNullOrWhiteSpace($retryAfterMs)) {
+    $msVal = 0
+    if ([int]::TryParse($retryAfterMs, [ref]$msVal)) {
+      $msSec = [int][Math]::Ceiling($msVal / 1000.0)
+      if ($null -eq $retryAfterSec -or $msSec -gt $retryAfterSec) {
+        $retryAfterSec = [Math]::Max($msSec, 0)
+      }
+    }
+  }
+
+  $rateReset = Get-HeaderValue -Headers $Headers -Name 'RateLimit-Reset'
+  if (-not [string]::IsNullOrWhiteSpace($rateReset)) {
+    $resetVal = 0
+    if ([int]::TryParse($rateReset, [ref]$resetVal)) {
+      # In SharePoint guidance this is seconds until refill.
+      $rateResetSec = [Math]::Max($resetVal, 0)
+    }
+  }
+
+  $candidates = @()
+  if ($null -ne $retryAfterSec) { $candidates += $retryAfterSec }
+  if ($null -ne $rateResetSec) { $candidates += $rateResetSec }
+
+  if ($candidates.Count -gt 0) {
+    # Microsoft guidance: use the greater of Retry-After and RateLimit-Reset when both exist.
+    return ($candidates | Measure-Object -Maximum).Maximum
+  }
+
+  return [Math]::Max($DefaultSeconds, 1)
 }
 
 function Invoke-PnPWithRetry {
@@ -143,31 +398,55 @@ function Invoke-PnPWithRetry {
     }
     catch {
       $statusCode = $null
+      $headers = $null
+      $requestId = $null
 
       # Under StrictMode, some exception types do not expose .Response.
       $responseProp = $_.Exception.PSObject.Properties['Response']
       if ($null -ne $responseProp -and $null -ne $responseProp.Value) {
         try { $statusCode = [int]$responseProp.Value.StatusCode } catch {}
+        try { $headers = $responseProp.Value.Headers } catch {}
+      }
+
+      if ($null -ne $headers) {
+        $requestId = Get-HeaderValue -Headers $headers -Name 'SPRequestGuid'
+        if ([string]::IsNullOrWhiteSpace($requestId)) {
+          $requestId = Get-HeaderValue -Headers $headers -Name 'request-id'
+        }
       }
 
       if (-not $statusCode -and $_.Exception.Message -match '(429|502|503|504)') {
         $statusCode = [int]$Matches[1]
       }
 
-      $isRetryable = $statusCode -in @(429, 502, 503, 504)
+      $looksThrottleLike = $_.Exception.Message -match '(throttl|too many requests|server too busy|try again)'
+      $isRetryable = ($statusCode -in @(429, 502, 503, 504)) -or ($statusCode -eq 403 -and $looksThrottleLike)
       if (-not $isRetryable) { throw }
 
       if ($retryCount -ge $MaxRetries) { throw }
 
-      $waitSec = $backoffSec
+      $headerWaitSec = Get-ThrottleWaitSecondsFromHeaders -Headers $headers -DefaultSeconds $backoffSec
+      $waitSec = [Math]::Max($backoffSec, $headerWaitSec)
+
+      # Add small jitter to avoid synchronized retry storms.
+      $jitterMs = Get-Random -Minimum 200 -Maximum 1200
+      $waitSec = [Math]::Min($waitSec + ($jitterMs / 1000.0), 900)
+
       $retryCount++
-      Write-Warn "Throttled ($statusCode). Waiting ${waitSec}s (attempt $retryCount/$MaxRetries)..."
-      Start-Sleep -Seconds $waitSec
+      $retryAfterHeader = if ($null -ne $headers) { Get-HeaderValue -Headers $headers -Name 'Retry-After' } else { $null }
+      $rateResetHeader = if ($null -ne $headers) { Get-HeaderValue -Headers $headers -Name 'RateLimit-Reset' } else { $null }
+
+      Write-Warn ("Throttled (HTTP {0}). Waiting {1:n1}s (attempt {2}/{3}). Retry-After='{4}' RateLimit-Reset='{5}' RequestId='{6}'" -f `
+        $statusCode, $waitSec, $retryCount, $MaxRetries, $retryAfterHeader, $rateResetHeader, $requestId)
+
+      Start-Sleep -Milliseconds ([int][Math]::Ceiling($waitSec * 1000.0))
       $backoffSec = [Math]::Min($backoffSec * 2, 300)
     }
   }
 }
+#endregion Throttling Helpers
 
+#region Connection and Source Helpers
 function Connect-ToPnPSite {
   [CmdletBinding()]
   param(
@@ -265,7 +544,9 @@ function Resolve-InfoPathXmlFromItem {
 
   return $null
 }
+#endregion Connection and Source Helpers
 
+#region XML and Attachment Parsing
 function Convert-InfoPathXmlToFieldMap {
   [CmdletBinding()]
   param([Parameter(Mandatory)] [xml]$XmlDoc)
@@ -384,7 +665,9 @@ function Get-InfoPathAttachmentsFromXml {
 
   return $results
 }
+#endregion XML and Attachment Parsing
 
+#region Target Schema and Mapping
 function Get-TargetWritableFields {
   [CmdletBinding()]
   param([Parameter(Mandatory)] [string]$ListTitle)
@@ -456,15 +739,22 @@ function Ensure-TargetFieldsForXmlKeys {
   param(
     [Parameter(Mandatory)] [string]$ListTitle,
     [Parameter(Mandatory)] [string[]]$XmlKeys,
-    [Parameter(Mandatory)] [object[]]$TargetFields
+    [Parameter(Mandatory)] [object[]]$TargetFields,
+    [Parameter()] [bool]$CreateMetadata = $true
   )
 
   $fieldMap = New-TargetFieldNameMap -TargetFields $TargetFields
   $created = 0
+  $missing = 0
 
   foreach ($xmlKey in $XmlKeys) {
     if ([string]::IsNullOrWhiteSpace($xmlKey)) { continue }
     if ($fieldMap.ContainsKey($xmlKey)) { continue }
+
+    if (-not $CreateMetadata) {
+      $missing++
+      continue
+    }
 
     $baseInternal = Convert-ToSafeInternalFieldName -InputName $xmlKey
     $candidate = $baseInternal
@@ -488,6 +778,10 @@ function Ensure-TargetFieldsForXmlKeys {
     }
   }
 
+  if ($missing -gt 0) {
+    Write-Warn "Metadata auto-creation disabled. $missing XML field(s) were not mapped because target columns do not exist."
+  }
+
   if ($created -gt 0) {
     Write-Info "Created $created missing target column(s)."
     $TargetFields = @(Get-TargetWritableFields -ListTitle $ListTitle)
@@ -498,6 +792,7 @@ function Ensure-TargetFieldsForXmlKeys {
     TargetFields = $TargetFields
     FieldMap = $fieldMap
     CreatedCount = $created
+    MissingCount = $missing
   }
 }
 
@@ -564,21 +859,58 @@ function New-TargetItemValues {
 
   return $values
 }
+#endregion Target Schema and Mapping
 
+#region Target Item and List Utilities
 function Add-ExtractedAttachmentsToItem {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] [string]$ListTitle,
     [Parameter(Mandatory)] [int]$ItemId,
     [Parameter(Mandatory)] [object[]]$Attachments,
-    [Parameter(Mandatory)] [string]$WorkingFolder
+    [Parameter(Mandatory)] [string]$WorkingFolder,
+    [Parameter()] [ValidateSet('Overwrite', 'Skip', 'CreateNew')] [string]$DuplicateMode = 'CreateNew'
   )
 
   if (-not (Test-Path -Path $WorkingFolder -PathType Container)) {
     New-Item -Path $WorkingFolder -ItemType Directory -Force | Out-Null
   }
 
+  $existingAttachmentNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  try {
+    $item = Invoke-PnPWithRetry {
+      Get-PnPListItem -List $ListTitle -Id $ItemId
+    }
+
+    Invoke-PnPWithRetry {
+      Get-PnPProperty -ClientObject $item -Property AttachmentFiles | Out-Null
+    }
+
+    foreach ($existing in @($item.AttachmentFiles)) {
+      if ($null -ne $existing -and -not [string]::IsNullOrWhiteSpace([string]$existing.FileName)) {
+        [void]$existingAttachmentNames.Add([string]$existing.FileName)
+      }
+    }
+  }
+  catch {
+    Write-Warn "Could not pre-read existing attachments for item ID $ItemId. Continuing upload. Error: $($_.Exception.Message)"
+  }
+
   foreach ($att in $Attachments) {
+    if ($existingAttachmentNames.Contains($att.FileName)) {
+      if ($DuplicateMode -eq 'Overwrite') {
+        Invoke-PnPWithRetry {
+          Remove-PnPListItemAttachment -List $ListTitle -Identity $ItemId -FileName $att.FileName -Force | Out-Null
+        }
+        [void]$existingAttachmentNames.Remove($att.FileName)
+        Write-Info "  Replaced existing attachment '$($att.FileName)' on item ID $ItemId"
+      }
+      elseif ($DuplicateMode -eq 'Skip') {
+        Write-Warn "  Skipped existing attachment '$($att.FileName)' on item ID $ItemId"
+        continue
+      }
+    }
+
     $filePath = Join-Path $WorkingFolder $att.FileName
     [IO.File]::WriteAllBytes($filePath, $att.Bytes)
 
@@ -586,6 +918,7 @@ function Add-ExtractedAttachmentsToItem {
       Add-PnPListItemAttachment -List $ListTitle -Identity $ItemId -Path $filePath -NewFileName $att.FileName | Out-Null
     }
 
+    [void]$existingAttachmentNames.Add($att.FileName)
     $script:stats.AttachmentsUploaded++
     Remove-Item -Path $filePath -Force -ErrorAction SilentlyContinue
   }
@@ -647,6 +980,191 @@ function Resolve-ListContext {
   }
 }
 
+function Escape-CamlValue {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [string]$Value)
+
+  return [System.Security.SecurityElement]::Escape($Value)
+}
+
+function Get-TargetTitleIndex {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$ListTitle,
+    [Parameter()] [int]$PageSize = 200
+  )
+
+  $index = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+  $items = Invoke-PnPWithRetry {
+    Get-PnPListItem -List $ListTitle -PageSize $PageSize -Fields @('Title')
+  }
+
+  foreach ($it in @($items)) {
+    $title = ''
+    if ($null -ne $it -and $null -ne $it.FieldValues -and $it.FieldValues.ContainsKey('Title')) {
+      $title = [string]$it.FieldValues['Title']
+    }
+
+    if ([string]::IsNullOrWhiteSpace($title)) { continue }
+    if (-not $index.ContainsKey($title)) {
+      $index[$title] = [int]$it.Id
+    }
+  }
+
+  return $index
+}
+
+function Normalize-SignatureValue {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [string]$Value)
+
+  $v = $Value.Trim()
+  $v = $v -replace '\s+', ' '
+  return $v.ToLowerInvariant()
+}
+
+function Convert-BytesToHexString {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [byte[]]$Bytes)
+
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($b in $Bytes) {
+    [void]$sb.Append($b.ToString('x2'))
+  }
+  return $sb.ToString()
+}
+
+function New-DuplicateSignature {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [hashtable]$Values,
+    [Parameter()] [string[]]$AttachmentNames = @()
+  )
+
+  $fieldParts = New-Object System.Collections.Generic.List[string]
+  $keys = @($Values.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+  foreach ($k in $keys) {
+    $raw = [string]$Values[$k]
+    if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+    $normalizedFieldName = $k.ToLowerInvariant()
+    $normalizedFieldValue = Normalize-SignatureValue -Value $raw
+    $fieldParts.Add($normalizedFieldName + '=' + $normalizedFieldValue)
+  }
+
+  $attachmentParts = @($AttachmentNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { Normalize-SignatureValue -Value ([string]$_) } | Sort-Object -Unique)
+
+  if ($fieldParts.Count -eq 0 -and $attachmentParts.Count -eq 0) {
+    return $null
+  }
+
+  $payload = "FIELDS:`n" + ($fieldParts -join "`n") + "`nATTACHMENTS:`n" + ($attachmentParts -join "`n")
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $hash = $sha.ComputeHash($bytes)
+  }
+  finally {
+    $sha.Dispose()
+  }
+
+  return Convert-BytesToHexString -Bytes $hash
+}
+
+function Get-TargetDuplicateSignatureIndex {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$ListTitle,
+    [Parameter(Mandatory)] [string[]]$SignatureFieldNames,
+    [Parameter()] [int]$PageSize = 200,
+    [Parameter()] [bool]$IncludeAttachmentNames = $true
+  )
+
+  $index = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $fieldSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($name in @($SignatureFieldNames)) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+      $null = $fieldSet.Add([string]$name)
+    }
+  }
+
+  # Title is always included to improve matching robustness when source/target schemas vary.
+  $null = $fieldSet.Add('Title')
+  $fieldsToFetch = @($fieldSet)
+
+  $items = Invoke-PnPWithRetry {
+    Get-PnPListItem -List $ListTitle -PageSize $PageSize -Fields $fieldsToFetch
+  }
+
+  foreach ($it in @($items)) {
+    $vals = @{}
+    foreach ($fieldName in $fieldsToFetch) {
+      if ($null -ne $it -and $null -ne $it.FieldValues -and $it.FieldValues.ContainsKey($fieldName)) {
+        $v = [string]$it.FieldValues[$fieldName]
+        if (-not [string]::IsNullOrWhiteSpace($v)) {
+          $vals[$fieldName] = $v
+        }
+      }
+    }
+
+    $attachmentNames = @()
+    if ($IncludeAttachmentNames) {
+      try {
+        Invoke-PnPWithRetry {
+          Get-PnPProperty -ClientObject $it -Property AttachmentFiles | Out-Null
+        }
+        $attachmentNames = @($it.AttachmentFiles | ForEach-Object { [string]$_.FileName })
+      }
+      catch {
+        Write-Warn "Could not read attachments for target item ID $($it.Id) while building duplicate signature index. Continuing. Error: $($_.Exception.Message)"
+      }
+    }
+
+    $signature = New-DuplicateSignature -Values $vals -AttachmentNames $attachmentNames
+    if ([string]::IsNullOrWhiteSpace($signature)) { continue }
+    if (-not $index.ContainsKey($signature)) {
+      $index[$signature] = [int]$it.Id
+    }
+  }
+
+  return $index
+}
+
+function Get-ExistingTargetItemByTitle {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$ListTitle,
+    [Parameter(Mandatory)] [string]$Title
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Title)) {
+    return $null
+  }
+
+  $safeTitle = Escape-CamlValue -Value $Title
+  $caml = @"
+<View>
+  <Query>
+    <Where>
+      <Eq>
+        <FieldRef Name='Title' />
+        <Value Type='Text'>$safeTitle</Value>
+      </Eq>
+    </Where>
+  </Query>
+  <RowLimit>1</RowLimit>
+</View>
+"@
+
+  $existing = Invoke-PnPWithRetry {
+    Get-PnPListItem -List $ListTitle -Query $caml
+  }
+
+  return @($existing) | Select-Object -First 1
+}
+#endregion Target Item and List Utilities
+
+#region Main Execution
 try {
   if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
     throw 'PnP.PowerShell module not found. Install with: Install-Module PnP.PowerShell -Scope CurrentUser'
@@ -656,6 +1174,10 @@ try {
 
   $sourceCtx = Resolve-ListContext -ListInput $SourceList -FallbackSiteUrl $SiteUrl
   $targetCtx = Resolve-ListContext -ListInput $TargetList -FallbackSiteUrl $SiteUrl
+  $Duplicate = Normalize-DuplicateMode -Mode $Duplicate
+
+  Start-RunLogging -Enabled $EnableLogging -Path $LogFilePath
+  Write-RunConfigurationSummary -SourceContext $sourceCtx -TargetContext $targetCtx
 
   Write-Info "Source context -> Site: $($sourceCtx.SiteUrl) | List: $($sourceCtx.ListIdentity)"
   Write-Info "Target context -> Site: $($targetCtx.SiteUrl) | List: $($targetCtx.ListIdentity)"
@@ -664,7 +1186,7 @@ try {
   Connect-ToPnPSite -Url $sourceCtx.SiteUrl
 
   $source = Invoke-PnPWithRetry {
-    Get-PnPListItem -List $sourceCtx.ListIdentity -PageSize $PageSize
+    Get-PnPListItem -List $sourceCtx.ListIdentity -PageSize $PageSize -Fields @('FileRef', 'Attachments')
   }
 
   if ($MaxItems -gt 0) {
@@ -684,7 +1206,7 @@ try {
   $readIndex = 0
   foreach ($item in $source) {
     $readIndex++
-    Write-Host "[Source $readIndex/$($script:stats.SourceItemsRead)] Source item ID $($item.Id)" -ForegroundColor White
+    Write-Info "[Source $readIndex/$($script:stats.SourceItemsRead)] Source item ID $($item.Id)"
 
     try {
       $xmlText = Resolve-InfoPathXmlFromItem -Item $item -ListTitle $sourceCtx.ListIdentity
@@ -729,7 +1251,9 @@ try {
     }
   }
 
-  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlKeys) -TargetFields $targetFields
+  Write-Info "CreateMetadata is set to: $CreateMetadata"
+  Write-Info "Duplicate mode is set to: $Duplicate"
+  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlKeys) -TargetFields $targetFields -CreateMetadata $CreateMetadata
   $targetFields = $schemaSync.TargetFields
   $targetFieldMap = $schemaSync.FieldMap
 
@@ -741,6 +1265,37 @@ try {
     }
   }
 
+  $allSignatureFieldNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($work in $migrationQueue) {
+    $valuesForItem = New-TargetItemValues -XmlMap $work.XmlMap -FieldNameMap $targetFieldMap -FieldByInternalName $targetFieldByInternalName -SourceItem ([pscustomobject]@{ Id = $work.SourceId })
+    Add-Member -InputObject $work -MemberType NoteProperty -Name Values -Value $valuesForItem -Force
+
+    foreach ($fieldName in @($valuesForItem.Keys)) {
+      $null = $allSignatureFieldNames.Add([string]$fieldName)
+    }
+
+    $sourceAttachments = @()
+    if (-not $SkipAttachments) {
+      $sourceAttachments = @(Get-InfoPathAttachmentsFromXml -XmlDoc $work.XmlDoc -BasicFileName $FallbackAttachmentName)
+    }
+    Add-Member -InputObject $work -MemberType NoteProperty -Name SourceAttachments -Value $sourceAttachments -Force
+  }
+
+  $targetDuplicateIndex = $null
+  if ($Duplicate -ne 'CreateNew') {
+    if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+      $includeAttachmentNames = -not $SkipAttachments
+      Write-Info 'Building in-memory duplicate signature index (metadata + attachments)...'
+      $targetDuplicateIndex = Get-TargetDuplicateSignatureIndex -ListTitle $targetCtx.ListIdentity -SignatureFieldNames @($allSignatureFieldNames) -PageSize $PageSize -IncludeAttachmentNames $includeAttachmentNames
+      Write-Info "Indexed duplicate signatures: $($targetDuplicateIndex.Count)"
+    }
+    else {
+      Write-Info 'Building in-memory duplicate index by Title...'
+      $targetDuplicateIndex = Get-TargetTitleIndex -ListTitle $targetCtx.ListIdentity -PageSize $PageSize
+      Write-Info "Indexed target titles: $($targetDuplicateIndex.Count)"
+    }
+  }
+
   if (-not (Test-Path -Path $TempFolder -PathType Container)) {
     New-Item -Path $TempFolder -ItemType Directory -Force | Out-Null
   }
@@ -748,29 +1303,121 @@ try {
   $i = 0
   foreach ($work in $migrationQueue) {
     $i++
-    Write-Host "[Target $i/$($migrationQueue.Count)] Source item ID $($work.SourceId)" -ForegroundColor White
+    Write-Info "[Target $i/$($migrationQueue.Count)] Source item ID $($work.SourceId)"
 
     try {
-      $values = New-TargetItemValues -XmlMap $work.XmlMap -FieldNameMap $targetFieldMap -FieldByInternalName $targetFieldByInternalName -SourceItem ([pscustomobject]@{ Id = $work.SourceId })
+      $values = $work.Values
+      $attachments = @($work.SourceAttachments)
 
-      if (-not $PSCmdlet.ShouldProcess("Target list '$($targetCtx.ListIdentity)'", "Create item from source ID $($work.SourceId)")) {
-        continue
-      }
+      $newItem = $null
+      $itemAction = 'Created'
+      $existingItemId = $null
+      $titleValue = if ($values.ContainsKey('Title')) { [string]$values['Title'] } else { '' }
+      $sourceDuplicateSignature = $null
 
-      $newItem = Invoke-PnPWithRetry {
-        Add-PnPListItem -List $targetCtx.ListIdentity -Values $values
-      }
-      $script:stats.TargetItemsCreated++
-
-      if (-not $SkipAttachments) {
-        $attachments = @(Get-InfoPathAttachmentsFromXml -XmlDoc $work.XmlDoc -BasicFileName $FallbackAttachmentName)
-        if ($attachments.Count -gt 0) {
-          Add-ExtractedAttachmentsToItem -ListTitle $targetCtx.ListIdentity -ItemId $newItem.Id -Attachments $attachments -WorkingFolder $TempFolder
-          Write-Host "  Attachments uploaded: $($attachments.Count)" -ForegroundColor Green
+      if ($Duplicate -ne 'CreateNew' -and $null -ne $targetDuplicateIndex) {
+        if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+          $attachmentNames = @($attachments | ForEach-Object { [string]$_.FileName })
+          $sourceDuplicateSignature = New-DuplicateSignature -Values $values -AttachmentNames $attachmentNames
+          if (-not [string]::IsNullOrWhiteSpace($sourceDuplicateSignature) -and $targetDuplicateIndex.ContainsKey($sourceDuplicateSignature)) {
+            $existingItemId = [int]$targetDuplicateIndex[$sourceDuplicateSignature]
+          }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($titleValue)) {
+          if ($targetDuplicateIndex.ContainsKey($titleValue)) {
+            $existingItemId = [int]$targetDuplicateIndex[$titleValue]
+          }
         }
       }
 
-      Write-Host "  Created target item ID $($newItem.Id)" -ForegroundColor Green
+      if ($null -ne $existingItemId) {
+        if ($Duplicate -eq 'Skip') {
+          $script:stats.Skipped++
+          if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+            Write-Warn "  Skipped duplicate source item $($work.SourceId): metadata+attachment signature matched target item ID $existingItemId (Title '$titleValue')."
+          }
+          else {
+            Write-Warn "  Skipped duplicate source item $($work.SourceId): target item with Title '$titleValue' already exists (ID $existingItemId)."
+          }
+          continue
+        }
+
+        if ($Duplicate -eq 'Overwrite') {
+          if (-not $PSCmdlet.ShouldProcess("Target list '$($targetCtx.ListIdentity)'", "Replace item ID $existingItemId from source ID $($work.SourceId)")) {
+            continue
+          }
+
+          Invoke-PnPWithRetry {
+            Remove-PnPListItem -List $targetCtx.ListIdentity -Identity $existingItemId -Force | Out-Null
+          }
+
+          $newItem = Invoke-PnPWithRetry {
+            Add-PnPListItem -List $targetCtx.ListIdentity -Values $values
+          }
+          $script:stats.TargetItemsCreated++
+
+          if ($null -ne $targetDuplicateIndex) {
+            if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+              if (-not [string]::IsNullOrWhiteSpace($sourceDuplicateSignature)) {
+                $targetDuplicateIndex[$sourceDuplicateSignature] = [int]$newItem.Id
+              }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($titleValue)) {
+              $targetDuplicateIndex[$titleValue] = [int]$newItem.Id
+            }
+          }
+
+          $itemAction = 'Replaced'
+
+          Write-Log -Message "  Replaced Title '$titleValue': old item ID $existingItemId -> new item ID $($newItem.Id)" -Level SUCCESS
+        }
+      }
+
+      if ($null -eq $newItem) {
+        if (-not $PSCmdlet.ShouldProcess("Target list '$($targetCtx.ListIdentity)'", "Create item from source ID $($work.SourceId)")) {
+          continue
+        }
+
+        $newItem = Invoke-PnPWithRetry {
+          Add-PnPListItem -List $targetCtx.ListIdentity -Values $values
+        }
+        $script:stats.TargetItemsCreated++
+
+        # Keep duplicate index current so duplicates within the same run are handled without extra queries.
+        if ($Duplicate -ne 'CreateNew' -and $null -ne $targetDuplicateIndex) {
+          if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+            if ([string]::IsNullOrWhiteSpace($sourceDuplicateSignature)) {
+              $attachmentNames = @($attachments | ForEach-Object { [string]$_.FileName })
+              $sourceDuplicateSignature = New-DuplicateSignature -Values $values -AttachmentNames $attachmentNames
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($sourceDuplicateSignature) -and -not $targetDuplicateIndex.ContainsKey($sourceDuplicateSignature)) {
+              $targetDuplicateIndex[$sourceDuplicateSignature] = [int]$newItem.Id
+            }
+          }
+          elseif (-not [string]::IsNullOrWhiteSpace($titleValue) -and -not $targetDuplicateIndex.ContainsKey($titleValue)) {
+            $targetDuplicateIndex[$titleValue] = [int]$newItem.Id
+          }
+        }
+      }
+
+      if (-not $SkipAttachments) {
+        if ($attachments.Count -gt 0) {
+          Add-ExtractedAttachmentsToItem -ListTitle $targetCtx.ListIdentity -ItemId $newItem.Id -Attachments $attachments -WorkingFolder $TempFolder -DuplicateMode $Duplicate
+          Write-Log -Message "  Attachments uploaded: $($attachments.Count)" -Level SUCCESS
+        }
+      }
+
+      if ($itemAction -eq 'Replaced') {
+        Write-Log -Message "  Completed replace for Title '$titleValue' (new item ID $($newItem.Id))" -Level SUCCESS
+      }
+      elseif ($itemAction -eq 'Created') {
+        $logTitle = if ([string]::IsNullOrWhiteSpace($titleValue)) { '<no title>' } else { $titleValue }
+        Write-Log -Message "  Created Title '$logTitle' (item ID $($newItem.Id))" -Level SUCCESS
+      }
+      else {
+        Write-Log -Message "  $itemAction target item ID $($newItem.Id)" -Level SUCCESS
+      }
     }
     catch {
       $script:stats.Failed++
@@ -778,19 +1425,35 @@ try {
     }
   }
 
-  Write-Host ''
-  Write-Host 'Migration complete' -ForegroundColor Green
-  Write-Host "  Source items read:     $($script:stats.SourceItemsRead)"
-  Write-Host "  XML resolved:          $($script:stats.XmlResolved)"
-  Write-Host "  Target items created:  $($script:stats.TargetItemsCreated)"
-  Write-Host "  Attachments uploaded:  $($script:stats.AttachmentsUploaded)"
-  Write-Host "  Skipped:               $($script:stats.Skipped)"
-  Write-Host "  Failed:                $($script:stats.Failed)"
+  $completionSeparator = ('=' * 92)
+  Write-Info ''
+  Write-Info $completionSeparator
+  Write-Log -Message 'INFO PATH MIGRATION - RUN SUMMARY' -Level SUCCESS
+  Write-Info $completionSeparator
+  Write-Info ("  Source items read    : {0}" -f $script:stats.SourceItemsRead)
+  Write-Info ("  XML resolved         : {0}" -f $script:stats.XmlResolved)
+  Write-Info ("  Target items created : {0}" -f $script:stats.TargetItemsCreated)
+  Write-Info ("  Attachments uploaded : {0}" -f $script:stats.AttachmentsUploaded)
+  Write-Info ("  Skipped              : {0}" -f $script:stats.Skipped)
+  Write-Info ("  Failed               : {0}" -f $script:stats.Failed)
+  Write-Info $completionSeparator
+  Write-Info ''
+  $script:runSucceeded = $true
 }
 catch {
   Write-Err "Script failed: $($_.Exception.Message)"
   throw
 }
 finally {
+  $elapsedSec = [Math]::Round(([datetime]::UtcNow - $script:runStartedUtc).TotalSeconds, 1)
+  $finalStatus = if (-not $script:runSucceeded) { 'FAILED' } elseif ($script:stats.Failed -gt 0) { 'PARTIAL' } else { 'SUCCESS' }
+  $statusLevel = switch ($finalStatus) {
+    'SUCCESS' { 'SUCCESS' }
+    'PARTIAL' { 'WARN' }
+    default { 'ERROR' }
+  }
+  Write-Log -Message "Run complete with status: $finalStatus (elapsed ${elapsedSec}s)" -Level $statusLevel
+  Write-Log -Message ('=' * 92) -Level INFO
   try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
 }
+#endregion Main Execution
