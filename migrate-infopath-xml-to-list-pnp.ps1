@@ -41,7 +41,7 @@ param(
   [string]$SourceList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite1/Shared%20Documents',
 
   [Parameter()]
-  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList',
+  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList5',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -587,6 +587,33 @@ function Convert-InfoPathXmlToFieldMap {
   return $map
 }
 
+function Get-InfoPathXmlMetadataKeys {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [xml]$XmlDoc)
+
+  $nsMgr = New-Object System.Xml.XmlNamespaceManager($XmlDoc.NameTable)
+  $myNamespace = 'http://schemas.microsoft.com/office/infopath/2003/myXSD/2017-07-28T18:04:07'
+  $nsMgr.AddNamespace('my', $myNamespace)
+
+  $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $leafNodes = $XmlDoc.SelectNodes('//*[not(*)]', $nsMgr)
+
+  foreach ($node in $leafNodes) {
+    if (-not $node) { continue }
+    if ([string]$node.NamespaceURI -ne $myNamespace) { continue }
+
+    $key = [string]$node.LocalName
+    if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+    # AttachmentControl contains the embedded file payload; attachments are uploaded separately.
+    if ($key -eq 'AttachmentControl') { continue }
+
+    $null = $keys.Add($key)
+  }
+
+  return @($keys)
+}
+
 function Get-InfoPathAttachmentsFromXml {
   [CmdletBinding()]
   param(
@@ -741,10 +768,17 @@ function Ensure-TargetFieldsForXmlKeys {
     [Parameter(Mandatory)] [string]$ListTitle,
     [Parameter(Mandatory)] [string[]]$XmlKeys,
     [Parameter(Mandatory)] [object[]]$TargetFields,
+    [Parameter()] [object[]]$AllTargetFields = @(),
     [Parameter()] [bool]$CreateMetadata = $true
   )
 
   $fieldMap = New-TargetFieldNameMap -TargetFields $TargetFields
+  $allFieldMap = if (@($AllTargetFields).Count -gt 0) {
+    New-TargetFieldNameMap -TargetFields $AllTargetFields
+  }
+  else {
+    New-TargetFieldNameMap -TargetFields $TargetFields
+  }
   $created = 0
   $missing = 0
 
@@ -761,7 +795,7 @@ function Ensure-TargetFieldsForXmlKeys {
     $candidate = $baseInternal
     $suffix = 0
 
-    while ($fieldMap.ContainsKey($candidate)) {
+    while ($fieldMap.ContainsKey($candidate) -or $allFieldMap.ContainsKey($candidate)) {
       $suffix++
       $base = if ($baseInternal.Length -gt 28) { $baseInternal.Substring(0, 28) } else { $baseInternal }
       $candidate = "{0}_{1}" -f $base, $suffix
@@ -774,9 +808,9 @@ function Ensure-TargetFieldsForXmlKeys {
 
     $created++
     $fieldMap[$xmlKey] = $candidate
-    if (-not $fieldMap.ContainsKey($candidate)) {
-      $fieldMap[$candidate] = $candidate
-    }
+    $fieldMap[$candidate] = $candidate
+    $allFieldMap[$xmlKey] = $candidate
+    $allFieldMap[$candidate] = $candidate
   }
 
   if ($missing -gt 0) {
@@ -1240,21 +1274,23 @@ try {
   Write-Info 'Connecting to target context...'
   Connect-ToPnPSite -Url $targetCtx.SiteUrl
 
+  $allTargetFields = @(Invoke-PnPWithRetry { Get-PnPField -List $targetCtx.ListIdentity })
   $targetFields = @(Get-TargetWritableFields -ListTitle $targetCtx.ListIdentity)
   Write-Info "Writable target fields discovered: $($targetFields.Count)"
 
-  $allXmlKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $allXmlSchemaKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($work in $migrationQueue) {
     $xmlMapForItem = Convert-InfoPathXmlToFieldMap -XmlDoc $work.XmlDoc
     Add-Member -InputObject $work -MemberType NoteProperty -Name XmlMap -Value $xmlMapForItem -Force
-    foreach ($k in $xmlMapForItem.Keys) {
-      $null = $allXmlKeys.Add([string]$k)
+    foreach ($k in (Get-InfoPathXmlMetadataKeys -XmlDoc $work.XmlDoc)) {
+      $null = $allXmlSchemaKeys.Add([string]$k)
     }
   }
 
   Write-Info "CreateMetadata is set to: $CreateMetadata"
   Write-Info "Duplicate mode is set to: $Duplicate"
-  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlKeys) -TargetFields $targetFields -CreateMetadata $CreateMetadata
+  Write-Info "InfoPath XML schema fields discovered: $($allXmlSchemaKeys.Count)"
+  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -AllTargetFields $allTargetFields -CreateMetadata $CreateMetadata
   $targetFields = $schemaSync.TargetFields
   $targetFieldMap = $schemaSync.FieldMap
 
