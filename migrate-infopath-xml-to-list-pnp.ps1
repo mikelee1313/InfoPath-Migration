@@ -28,6 +28,7 @@
   Author: Mike Lee
   Created: 7/17/2026
   Updated: 7/21/2026 - Added duplicate detection and handling, logging, and throttling support.
+  Updated: 7/24/2026 - Fixed bug that would not create columns if they were empty.
   
 #>
 
