@@ -81,7 +81,7 @@ The script supports InfoPath XML from:
 - `TempFolder` (string)
 - `FallbackAttachmentName` (string)
 - `CreateMetadata` (bool)
-  - `true`: create missing target text columns.
+  - `true`: create missing target text columns from discovered InfoPath XML fields, including fields that are present but empty in every source XML item.
   - `false`: do not create missing columns, unmapped fields are skipped.
 - `SkipAttachments` (switch)
   - If set, no attachment upload is attempted.
