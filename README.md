@@ -1,4 +1,4 @@
-# InfoPath XML to SharePoint List Migration (PnP App-Only)
+# InfoPath to SharePoint List Migration Tool (PnP App-Only)
 
 Migrate legacy InfoPath XML records from a source SharePoint list/library into a modern target SharePoint list using PnP.PowerShell and app-only authentication.
 
