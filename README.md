@@ -1,4 +1,4 @@
-# InfoPath to SharePoint List Migration Tool (PnP App-Only)
+# InfoPath XML to SharePoint List Migration (PnP App-Only)
 
 Migrate legacy InfoPath XML records from a source SharePoint list/library into a modern target SharePoint list using PnP.PowerShell and app-only authentication.
 
@@ -11,7 +11,7 @@ This README reflects the current script behavior, including advanced duplicate d
 1. Connects to source and target SharePoint contexts (can be different sites).
 2. Reads source items and resolves InfoPath XML payloads.
 3. Parses XML metadata from InfoPath namespace leaf nodes.
-4. Optionally auto-creates missing target columns (Text type).
+4. Optionally auto-creates missing target columns (Text or rich multiple-line text type).
 5. Maps metadata into target field values with sanitization.
 6. Extracts embedded InfoPath attachments from base64 payloads.
 7. Handles duplicates via configurable action and detection strategy.
@@ -81,7 +81,7 @@ The script supports InfoPath XML from:
 - `TempFolder` (string)
 - `FallbackAttachmentName` (string)
 - `CreateMetadata` (bool)
-  - `true`: create missing target text columns from discovered InfoPath XML fields, including fields that are present but empty in every source XML item.
+  - `true`: create missing target columns. InfoPath XHTML fields become rich multiple-line text; other fields become single-line text.
   - `false`: do not create missing columns, unmapped fields are skipped.
 - `SkipAttachments` (switch)
   - If set, no attachment upload is attempted.
@@ -204,7 +204,8 @@ Retry wait uses:
 
 ## Important Implementation Notes
 
-- Metadata column creation is Text-only today.
+- InfoPath fields containing XHTML are migrated to rich multiple-line text (`Note`) columns with their HTML preserved.
+- Other auto-created metadata columns use single-line text.
 - Text values are sanitized for control characters.
 - Single-line text fields are flattened and truncated to 255 chars.
 - Attachment duplicate matching in `MetadataAndAttachments` uses attachment file names, not file content hashes.
