@@ -22,13 +22,14 @@
 
 .NOTES
   - Default mapping uses target field internal names matched to InfoPath XML element names.
-  - For rich text nodes (embedded XHTML), text content is extracted.
+  - Rich text nodes (embedded XHTML) are preserved as HTML in rich multiple-line text columns.
   - For values that look like embedded attachment payloads, metadata mapping skips those nodes.
 
   Author: Mike Lee
   Created: 7/17/2026
   Updated: 7/21/2026 - Added duplicate detection and handling, logging, and throttling support.
   Updated: 7/24/2026 - Fixed bug that would not create columns if they were empty.
+  Updated: 9/3/2026 - Preserve XHTML fields as rich multiple-line text columns.
   
 #>
 
@@ -39,10 +40,10 @@ param(
   [string]$SiteUrl= 'https://m365cpi13246019.sharepoint.com',
 
   [Parameter()]
-  [string]$SourceList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite1/Shared%20Documents',
+  [string]$SourceList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/InfoPath',
 
   [Parameter()]
-  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList5',
+  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList6',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -559,19 +560,26 @@ function Convert-InfoPathXmlToFieldMap {
 
   $map = @{}
 
-  # Leaf elements only: we map by local name so matching works against target internal names.
-  $leafNodes = $XmlDoc.SelectNodes('//*[not(*)]', $nsMgr)
+  # Include simple leaf fields and fields containing XHTML, but exclude structural my:* groups.
+  $fieldNodes = $XmlDoc.SelectNodes('//my:*[not(my:*)]', $nsMgr)
 
-  foreach ($node in $leafNodes) {
+  foreach ($node in $fieldNodes) {
     if (-not $node) { continue }
-
-    # Ignore embedded XHTML nodes (div, a, br, font, strong, etc.).
-    if ([string]$node.NamespaceURI -ne $myNamespace) { continue }
 
     $key = [string]$node.LocalName
     if ([string]::IsNullOrWhiteSpace($key)) { continue }
 
-    $raw = [string]$node.InnerText
+    $xhtmlRoot = @($node.ChildNodes | Where-Object {
+      $_.NodeType -eq [System.Xml.XmlNodeType]::Element -and
+      [string]$_.NamespaceURI -eq 'http://www.w3.org/1999/xhtml'
+    }) | Select-Object -First 1
+
+    $raw = if ($null -ne $xhtmlRoot) {
+      [string]$xhtmlRoot.InnerXml
+    }
+    else {
+      [string]$node.InnerText
+    }
     if ([string]::IsNullOrWhiteSpace($raw)) { continue }
 
     # Skip likely encoded attachment payloads from metadata mapping.
@@ -597,11 +605,10 @@ function Get-InfoPathXmlMetadataKeys {
   $nsMgr.AddNamespace('my', $myNamespace)
 
   $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  $leafNodes = $XmlDoc.SelectNodes('//*[not(*)]', $nsMgr)
+  $fieldNodes = $XmlDoc.SelectNodes('//my:*[not(my:*)]', $nsMgr)
 
-  foreach ($node in $leafNodes) {
+  foreach ($node in $fieldNodes) {
     if (-not $node) { continue }
-    if ([string]$node.NamespaceURI -ne $myNamespace) { continue }
 
     $key = [string]$node.LocalName
     if ([string]::IsNullOrWhiteSpace($key)) { continue }
@@ -610,6 +617,24 @@ function Get-InfoPathXmlMetadataKeys {
     if ($key -eq 'AttachmentControl') { continue }
 
     $null = $keys.Add($key)
+  }
+
+  return @($keys)
+}
+
+function Get-InfoPathXmlRichTextKeys {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [xml]$XmlDoc)
+
+  $nsMgr = New-Object System.Xml.XmlNamespaceManager($XmlDoc.NameTable)
+  $nsMgr.AddNamespace('my', 'http://schemas.microsoft.com/office/infopath/2003/myXSD/2017-07-28T18:04:07')
+  $nsMgr.AddNamespace('xhtml', 'http://www.w3.org/1999/xhtml')
+
+  $keys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($node in $XmlDoc.SelectNodes('//my:*[xhtml:*]', $nsMgr)) {
+    if ($node -and -not [string]::IsNullOrWhiteSpace([string]$node.LocalName)) {
+      $null = $keys.Add([string]$node.LocalName)
+    }
   }
 
   return @($keys)
@@ -770,6 +795,7 @@ function Ensure-TargetFieldsForXmlKeys {
     [Parameter(Mandatory)] [string[]]$XmlKeys,
     [Parameter(Mandatory)] [object[]]$TargetFields,
     [Parameter()] [object[]]$AllTargetFields = @(),
+    [Parameter()] [string[]]$RichTextKeys = @(),
     [Parameter()] [bool]$CreateMetadata = $true
   )
 
@@ -782,6 +808,12 @@ function Ensure-TargetFieldsForXmlKeys {
   }
   $created = 0
   $missing = 0
+  $richTextKeySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($richTextKey in $RichTextKeys) {
+    if (-not [string]::IsNullOrWhiteSpace($richTextKey)) {
+      $null = $richTextKeySet.Add($richTextKey)
+    }
+  }
 
   foreach ($xmlKey in $XmlKeys) {
     if ([string]::IsNullOrWhiteSpace($xmlKey)) { continue }
@@ -802,9 +834,20 @@ function Ensure-TargetFieldsForXmlKeys {
       $candidate = "{0}_{1}" -f $base, $suffix
     }
 
-    Write-Warn "Target column '$xmlKey' does not exist. Creating it as Text (internal: $candidate)."
-    Invoke-PnPWithRetry {
-      Add-PnPField -List $ListTitle -DisplayName $xmlKey -InternalName $candidate -Type Text -Group 'InfoPath Migrated Columns' | Out-Null
+    if ($richTextKeySet.Contains($xmlKey)) {
+      Write-Warn "Target column '$xmlKey' does not exist. Creating it as rich multiple-line text (internal: $candidate)."
+      $escapedDisplayName = [System.Security.SecurityElement]::Escape($xmlKey)
+      $escapedInternalName = [System.Security.SecurityElement]::Escape($candidate)
+      $fieldXml = "<Field Type='Note' DisplayName='$escapedDisplayName' Name='$escapedInternalName' StaticName='$escapedInternalName' NumLines='20' RichText='TRUE' RichTextMode='FullHtml' IsolateStyles='TRUE' AppendOnly='FALSE' Group='InfoPath Migrated Columns' />"
+      Invoke-PnPWithRetry {
+        Add-PnPFieldFromXml -List $ListTitle -FieldXml $fieldXml | Out-Null
+      }
+    }
+    else {
+      Write-Warn "Target column '$xmlKey' does not exist. Creating it as Text (internal: $candidate)."
+      Invoke-PnPWithRetry {
+        Add-PnPField -List $ListTitle -DisplayName $xmlKey -InternalName $candidate -Type Text -Group 'InfoPath Migrated Columns' | Out-Null
+      }
     }
 
     $created++
@@ -1280,18 +1323,22 @@ try {
   Write-Info "Writable target fields discovered: $($targetFields.Count)"
 
   $allXmlSchemaKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $allXmlRichTextKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($work in $migrationQueue) {
     $xmlMapForItem = Convert-InfoPathXmlToFieldMap -XmlDoc $work.XmlDoc
     Add-Member -InputObject $work -MemberType NoteProperty -Name XmlMap -Value $xmlMapForItem -Force
     foreach ($k in (Get-InfoPathXmlMetadataKeys -XmlDoc $work.XmlDoc)) {
       $null = $allXmlSchemaKeys.Add([string]$k)
     }
+    foreach ($k in (Get-InfoPathXmlRichTextKeys -XmlDoc $work.XmlDoc)) {
+      $null = $allXmlRichTextKeys.Add([string]$k)
+    }
   }
 
   Write-Info "CreateMetadata is set to: $CreateMetadata"
   Write-Info "Duplicate mode is set to: $Duplicate"
   Write-Info "InfoPath XML schema fields discovered: $($allXmlSchemaKeys.Count)"
-  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -AllTargetFields $allTargetFields -CreateMetadata $CreateMetadata
+  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -AllTargetFields $allTargetFields -RichTextKeys @($allXmlRichTextKeys) -CreateMetadata $CreateMetadata
   $targetFields = $schemaSync.TargetFields
   $targetFieldMap = $schemaSync.FieldMap
 
