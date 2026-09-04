@@ -43,7 +43,7 @@ param(
   [string]$SourceList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/InfoPath',
 
   [Parameter()]
-  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList6',
+  [string]$TargetList = 'https://m365cpi13246019.sharepoint.com/sites/SPSite2/Lists/TargetList10',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -69,6 +69,10 @@ param(
   [int]$PageSize = 200,
 
   [Parameter()]
+  [ValidateRange(1, 1000)]
+  [int]$BatchSize = 100,
+
+  [Parameter()]
   [int]$MaxItems = 0,
 
   [Parameter()]
@@ -85,8 +89,8 @@ param(
   [string]$Duplicate = 'Skip',
 
   [Parameter()]
-  [ValidateSet('Title', 'MetadataAndAttachments')]
-  [string]$DuplicateDetection = 'MetadataAndAttachments',
+  [ValidateSet('SourceItemKey', 'Title', 'MetadataAndAttachments')]
+  [string]$DuplicateDetection = 'SourceItemKey',
 
   [Parameter()]
   [bool]$EnableLogging = $true,
@@ -96,6 +100,9 @@ param(
 
   [Parameter()]
   [string]$LogFilePath = (Join-Path $PSScriptRoot ("InfoPathMigration-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))),
+
+  [Parameter()]
+  [string]$StateFilePath = '',
 
   [Parameter()]
   [switch]$SkipAttachments
@@ -111,6 +118,8 @@ $script:LoggingEnabled = $false
 $script:DebugLoggingEnabled = $DebugLogging
 $script:runSucceeded = $false
 $script:runStartedUtc = [datetime]::UtcNow
+$stagingFolder = $null
+$migrationState = @{}
 
 # Use explicit validation here to avoid interactive prompts caused by Mandatory parameters.
 $requiredParams = @{
@@ -209,6 +218,7 @@ function Get-DuplicateDetectionDescription {
   param([Parameter(Mandatory)] [string]$Mode)
 
   switch ($Mode.ToLowerInvariant()) {
+    'sourceitemkey' { return 'Duplicate match by source list identity and immutable source item ID.' }
     'title' { return 'Duplicate match by Title only (fastest).' }
     'metadataandattachments' { return 'Duplicate match by mapped metadata fields + attachment file names.' }
     default { return 'Unknown duplicate detection mode.' }
@@ -290,6 +300,7 @@ function Write-RunConfigurationSummary {
   Write-Info ("  Target             : {0} | {1}" -f $TargetContext.SiteUrl, $TargetContext.ListIdentity)
   Write-Info ("  AuthType           : {0}" -f $AuthType)
   Write-Info ("  PageSize           : {0}" -f $PageSize)
+  Write-Info ("  BatchSize          : {0}" -f $BatchSize)
   Write-Info ("  MaxItems           : {0}" -f $MaxItems)
   Write-Info ("  CreateMetadata     : {0}" -f $CreateMetadata)
   Write-Info ("  Duplicate Mode     : {0}" -f $Duplicate)
@@ -302,8 +313,84 @@ function Write-RunConfigurationSummary {
   if ($EnableLogging) {
     Write-Info ("  LogFilePath        : {0}" -f $LogFilePath)
   }
+  Write-Info ("  StateFilePath      : {0}" -f $StateFilePath)
   Write-Info $separator
   Write-Info ''
+}
+
+function Load-MigrationState {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$Path,
+    [Parameter(Mandatory)] [string]$SourceSite,
+    [Parameter(Mandatory)] [string]$SourceList,
+    [Parameter(Mandatory)] [string]$TargetSite,
+    [Parameter(Mandatory)] [string]$TargetList
+  )
+
+  $state = [ordered]@{
+    SourceSite = $SourceSite
+    SourceList = $SourceList
+    TargetSite = $TargetSite
+    TargetList = $TargetList
+    Items = @{}
+  }
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $state }
+
+  $json = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+  $jsonProperties = $json.PSObject.Properties
+  foreach ($name in @('SourceSite', 'SourceList', 'TargetSite', 'TargetList')) {
+    if ($null -eq $jsonProperties[$name]) {
+      throw "Migration state '$Path' uses an older format without scope metadata. Rename or remove it before rerunning."
+    }
+  }
+  foreach ($name in @('SourceSite', 'SourceList', 'TargetSite', 'TargetList')) {
+    if ([string]$json.$name -ne [string]$state[$name]) {
+      throw "Migration state '$Path' belongs to a different source or target. Use a separate StateFilePath."
+    }
+  }
+  if ($null -eq $jsonProperties['Items'] -or $null -eq $json.Items) {
+    throw "Migration state '$Path' uses an older format without scope metadata. Rename or remove it before rerunning."
+  }
+  foreach ($property in $json.Items.PSObject.Properties) {
+    $entry = [ordered]@{ TargetId = 0; Status = 'Created'; AttachmentNames = @() }
+    if ($null -ne $property.Value.TargetId) { $entry.TargetId = [int]$property.Value.TargetId }
+    if (-not [string]::IsNullOrWhiteSpace([string]$property.Value.Status)) { $entry.Status = [string]$property.Value.Status }
+    if ($null -ne $property.Value.AttachmentNames) { $entry.AttachmentNames = @($property.Value.AttachmentNames | ForEach-Object { [string]$_ }) }
+    if ($entry.TargetId -gt 0) { $state.Items[[string]$property.Name] = $entry }
+  }
+  return $state
+}
+
+function Save-MigrationState {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$Path,
+    [Parameter(Mandatory)] $State
+  )
+
+  $folder = Split-Path -Path $Path -Parent
+  if (-not [string]::IsNullOrWhiteSpace($folder) -and -not (Test-Path -LiteralPath $folder -PathType Container)) {
+    New-Item -Path $folder -ItemType Directory -Force | Out-Null
+  }
+  $tempPath = "$Path.tmp"
+  $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+  Move-Item -LiteralPath $tempPath -Destination $Path -Force
+}
+
+function Get-TargetItemById {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$ListTitle,
+    [Parameter(Mandatory)] [int]$ItemId
+  )
+
+  try {
+    return Invoke-PnPWithRetry { Get-PnPListItem -List $ListTitle -Id $ItemId }
+  }
+  catch {
+    return $null
+  }
 }
 #endregion Logging Helpers
 
@@ -547,6 +634,32 @@ function Resolve-InfoPathXmlFromItem {
 
   return $null
 }
+
+function Get-SourceItemBatch {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$ListTitle,
+    [Parameter(Mandatory)] [int]$AfterId,
+    [Parameter(Mandatory)] [int]$BatchSize
+  )
+
+  $caml = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where>
+      <Gt><FieldRef Name='ID' /><Value Type='Counter'>$AfterId</Value></Gt>
+    </Where>
+    <OrderBy><FieldRef Name='ID' Ascending='TRUE' /></OrderBy>
+  </Query>
+  <ViewFields><FieldRef Name='ID' /><FieldRef Name='FileRef' /><FieldRef Name='Attachments' /></ViewFields>
+  <RowLimit>$BatchSize</RowLimit>
+</View>
+"@
+
+  return @(Invoke-PnPWithRetry {
+    Get-PnPListItem -List $ListTitle -Query $caml
+  })
+}
 #endregion Connection and Source Helpers
 
 #region XML and Attachment Parsing
@@ -644,13 +757,14 @@ function Get-InfoPathAttachmentsFromXml {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] [xml]$XmlDoc,
-    [Parameter()] [string]$BasicFileName = 'uploadedFile.bin'
+    [Parameter()] [string]$BasicFileName = 'uploadedFile.bin',
+    [Parameter()] [string]$OutputFolder
   )
 
   $results = New-Object System.Collections.Generic.List[object]
   $nameCounter = @{}
 
-  foreach ($textNode in $XmlDoc.SelectNodes('//*[text()]')) {
+  foreach ($textNode in $XmlDoc.SelectNodes('//*[text() and not(*)]')) {
     $text = [string]$textNode.InnerText
     if (-not (Test-IsLikelyBase64 -Text $text)) { continue }
 
@@ -674,7 +788,8 @@ function Get-InfoPathAttachmentsFromXml {
       $headerLen = 24
 
       if ($nameByteLen -gt 0 -and ($headerLen + $nameByteLen) -lt $bytes.Length) {
-        $nameBytes = $bytes[$headerLen..($headerLen + $nameByteLen - 1)]
+        $nameBytes = New-Object byte[] $nameByteLen
+        [Buffer]::BlockCopy($bytes, $headerLen, $nameBytes, 0, $nameByteLen)
         try {
           $decodedName = [System.Text.Encoding]::Unicode.GetString($nameBytes)
           $decodedName = $decodedName.TrimEnd([char]0).Trim()
@@ -688,7 +803,8 @@ function Get-InfoPathAttachmentsFromXml {
 
         $contentStart = $headerLen + $nameByteLen
         if ($contentStart -lt $bytes.Length) {
-          $payload = $bytes[$contentStart..($bytes.Length - 1)]
+          $payload = New-Object byte[] ($bytes.Length - $contentStart)
+          [Buffer]::BlockCopy($bytes, $contentStart, $payload, 0, $payload.Length)
         }
       }
     }
@@ -710,9 +826,19 @@ function Get-InfoPathAttachmentsFromXml {
       $finalName = "{0}-copy{1}{2}" -f $base, $nameCounter[$safeName], $ext
     }
 
+    $filePath = $null
+    if (-not [string]::IsNullOrWhiteSpace($OutputFolder)) {
+      if (-not (Test-Path -Path $OutputFolder -PathType Container)) {
+        New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+      }
+      $filePath = Join-Path $OutputFolder $finalName
+      [IO.File]::WriteAllBytes($filePath, $payload)
+    }
+
     $results.Add([pscustomobject]@{
       FileName = $finalName
-      Bytes = $payload
+      Bytes = if ($null -eq $filePath) { $payload } else { $null }
+      FilePath = $filePath
       NodeName = [string]$textNode.LocalName
     })
   }
@@ -788,6 +914,44 @@ function Convert-ToSafeInternalFieldName {
   return $name
 }
 
+function Assert-TargetSchemaCompatibility {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string[]]$XmlKeys,
+    [Parameter(Mandatory)] [object[]]$TargetFields,
+    [Parameter(Mandatory)] [string[]]$RichTextKeys,
+    [Parameter(Mandatory)] [string[]]$LongTextKeys
+  )
+
+  $fieldMap = New-TargetFieldNameMap -TargetFields $TargetFields
+  $richTextSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $longTextSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($key in $RichTextKeys) { if (-not [string]::IsNullOrWhiteSpace($key)) { $null = $richTextSet.Add($key) } }
+  foreach ($key in $LongTextKeys) { if (-not [string]::IsNullOrWhiteSpace($key)) { $null = $longTextSet.Add($key) } }
+
+  $incompatible = New-Object System.Collections.Generic.List[string]
+  foreach ($xmlKey in $XmlKeys) {
+    if (-not $fieldMap.ContainsKey($xmlKey)) { continue }
+    $internalName = [string]$fieldMap[$xmlKey]
+    $field = @($TargetFields | Where-Object { [string]$_.InternalName -eq $internalName }) | Select-Object -First 1
+    if ($null -eq $field) { continue }
+
+    $type = [string]$field.TypeAsString
+    $richTextProperty = $field.PSObject.Properties['RichText']
+    $isRich = $null -ne $richTextProperty -and ([string]$richTextProperty.Value) -match '^(?i:true)$'
+    if ($richTextSet.Contains($xmlKey) -and ($type -ne 'Note' -or -not $isRich)) {
+      $incompatible.Add("$xmlKey requires enhanced rich text (Note/RichText), but target field '$internalName' is $type.")
+    }
+    elseif ($longTextSet.Contains($xmlKey) -and $type -eq 'Text') {
+      $incompatible.Add("$xmlKey contains values over 255 characters, but target field '$internalName' is single-line Text.")
+    }
+  }
+
+  if ($incompatible.Count -gt 0) {
+    throw "Target schema is incompatible with the XML data. No target items were written:`n$($incompatible -join "`n")"
+  }
+}
+
 function Ensure-TargetFieldsForXmlKeys {
   [CmdletBinding()]
   param(
@@ -796,6 +960,7 @@ function Ensure-TargetFieldsForXmlKeys {
     [Parameter(Mandatory)] [object[]]$TargetFields,
     [Parameter()] [object[]]$AllTargetFields = @(),
     [Parameter()] [string[]]$RichTextKeys = @(),
+    [Parameter()] [string[]]$LongTextKeys = @(),
     [Parameter()] [bool]$CreateMetadata = $true
   )
 
@@ -814,34 +979,58 @@ function Ensure-TargetFieldsForXmlKeys {
       $null = $richTextKeySet.Add($richTextKey)
     }
   }
+  $longTextKeySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($longTextKey in $LongTextKeys) {
+    if (-not [string]::IsNullOrWhiteSpace($longTextKey)) {
+      $null = $longTextKeySet.Add($longTextKey)
+    }
+  }
+  $longTextMappings = @{}
+  $richTextMappings = @{}
 
   foreach ($xmlKey in $XmlKeys) {
     if ([string]::IsNullOrWhiteSpace($xmlKey)) { continue }
-    if ($fieldMap.ContainsKey($xmlKey)) { continue }
+    if ($fieldMap.ContainsKey($xmlKey)) {
+      $existingInternal = [string]$fieldMap[$xmlKey]
+      $existingField = @($TargetFields | Where-Object { [string]$_.InternalName -eq $existingInternal }) | Select-Object -First 1
+      if ($richTextKeySet.Contains($xmlKey)) {
+        $richTextProperty = if ($null -ne $existingField) { $existingField.PSObject.Properties['RichText'] } else { $null }
+        if ($null -ne $existingField -and [string]$existingField.TypeAsString -eq 'Note' -and $null -ne $richTextProperty -and ([string]$richTextProperty.Value) -match '^(?i:true)$') { continue }
+        Write-Warn "Target field '$xmlKey' already exists but is not enhanced rich text. No alternate column will be created; change that existing column to enhanced rich text before rerunning."
+        continue
+      }
+      elseif (-not $longTextKeySet.Contains($xmlKey)) { continue }
+      if ($null -eq $existingField -or [string]$existingField.TypeAsString -ne 'Text') { continue }
+      Write-Warn "Target field '$xmlKey' already exists as single-line Text and contains values over 255 characters. No alternate column will be created; change '$xmlKey' to a multiple-line text column before rerunning."
+      continue
+    }
 
     if (-not $CreateMetadata) {
       $missing++
       continue
     }
 
-    $baseInternal = Convert-ToSafeInternalFieldName -InputName $xmlKey
-    $candidate = $baseInternal
-    $suffix = 0
-
-    while ($fieldMap.ContainsKey($candidate) -or $allFieldMap.ContainsKey($candidate)) {
-      $suffix++
-      $base = if ($baseInternal.Length -gt 28) { $baseInternal.Substring(0, 28) } else { $baseInternal }
-      $candidate = "{0}_{1}" -f $base, $suffix
-    }
+    $candidate = [string]$xmlKey
 
     if ($richTextKeySet.Contains($xmlKey)) {
-      Write-Warn "Target column '$xmlKey' does not exist. Creating it as rich multiple-line text (internal: $candidate)."
+      Write-Warn "Target field '$xmlKey' is rich text. Creating enhanced rich text Note field '$candidate'."
       $escapedDisplayName = [System.Security.SecurityElement]::Escape($xmlKey)
       $escapedInternalName = [System.Security.SecurityElement]::Escape($candidate)
       $fieldXml = "<Field Type='Note' DisplayName='$escapedDisplayName' Name='$escapedInternalName' StaticName='$escapedInternalName' NumLines='20' RichText='TRUE' RichTextMode='FullHtml' IsolateStyles='TRUE' AppendOnly='FALSE' Group='InfoPath Migrated Columns' />"
       Invoke-PnPWithRetry {
         Add-PnPFieldFromXml -List $ListTitle -FieldXml $fieldXml | Out-Null
       }
+      $richTextMappings[$xmlKey] = $candidate
+    }
+    elseif ($longTextKeySet.Contains($xmlKey)) {
+      Write-Warn "Target field '$xmlKey' contains values over 255 characters. Creating multiple-line Note field '$candidate'."
+      $escapedDisplayName = [System.Security.SecurityElement]::Escape($xmlKey)
+      $escapedInternalName = [System.Security.SecurityElement]::Escape($candidate)
+      $fieldXml = "<Field Type='Note' DisplayName='$escapedDisplayName' Name='$escapedInternalName' StaticName='$escapedInternalName' NumLines='20' RichText='FALSE' AppendOnly='FALSE' Group='InfoPath Migrated Columns' />"
+      Invoke-PnPWithRetry {
+        Add-PnPFieldFromXml -List $ListTitle -FieldXml $fieldXml | Out-Null
+      }
+      $longTextMappings[$xmlKey] = $candidate
     }
     else {
       Write-Warn "Target column '$xmlKey' does not exist. Creating it as Text (internal: $candidate)."
@@ -865,6 +1054,12 @@ function Ensure-TargetFieldsForXmlKeys {
     Write-Info "Created $created missing target column(s)."
     $TargetFields = @(Get-TargetWritableFields -ListTitle $ListTitle)
     $fieldMap = New-TargetFieldNameMap -TargetFields $TargetFields
+    foreach ($mapping in $longTextMappings.GetEnumerator()) {
+      $fieldMap[$mapping.Key] = $mapping.Value
+    }
+    foreach ($mapping in $richTextMappings.GetEnumerator()) {
+      $fieldMap[$mapping.Key] = $mapping.Value
+    }
   }
 
   return [pscustomobject]@{
@@ -908,12 +1103,9 @@ function New-TargetItemValues {
           ''
         }
 
-        # Single-line text fields cannot contain line breaks and are max 255 chars.
+        # Keep the source value intact; SharePoint will reject an incompatible target field rather than silently losing data.
         if ($fieldType -eq 'Text') {
           $sanitized = $sanitized -replace "`r`n|`n|`r", ' '
-          if ($sanitized.Length -gt 255) {
-            $sanitized = $sanitized.Substring(0, 255)
-          }
         }
 
         if (-not [string]::IsNullOrWhiteSpace($sanitized)) {
@@ -986,20 +1178,30 @@ function Add-ExtractedAttachmentsToItem {
       }
       elseif ($DuplicateMode -eq 'Skip') {
         Write-Warn "  Skipped existing attachment '$($att.FileName)' on item ID $ItemId"
+        if ($att.PSObject.Properties['FilePath'] -and (Test-Path -LiteralPath $att.FilePath -PathType Leaf)) {
+          Remove-Item -LiteralPath $att.FilePath -Force -ErrorAction SilentlyContinue
+        }
         continue
       }
     }
 
-    $filePath = Join-Path $WorkingFolder $att.FileName
-    [IO.File]::WriteAllBytes($filePath, $att.Bytes)
-
-    Invoke-PnPWithRetry {
-      Add-PnPListItemAttachment -List $ListTitle -Identity $ItemId -Path $filePath -NewFileName $att.FileName | Out-Null
+    $filePath = $null
+    if ($att.PSObject.Properties['FilePath'] -and -not [string]::IsNullOrWhiteSpace([string]$att.FilePath)) {
+      $filePath = [string]$att.FilePath
+    }
+    else {
+      $filePath = Join-Path $WorkingFolder $att.FileName
+      [IO.File]::WriteAllBytes($filePath, $att.Bytes)
     }
 
-    [void]$existingAttachmentNames.Add($att.FileName)
-    $script:stats.AttachmentsUploaded++
-    Remove-Item -Path $filePath -Force -ErrorAction SilentlyContinue
+    try {
+      Add-PnPListItemAttachment -List $ListTitle -Identity $ItemId -Path $filePath -NewFileName $att.FileName -ErrorAction Stop | Out-Null
+      [void]$existingAttachmentNames.Add($att.FileName)
+      $script:stats.AttachmentsUploaded++
+    }
+    finally {
+      Remove-Item -LiteralPath $filePath -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -1255,6 +1457,14 @@ try {
   $targetCtx = Resolve-ListContext -ListInput $TargetList -FallbackSiteUrl $SiteUrl
   $Duplicate = Normalize-DuplicateMode -Mode $Duplicate
 
+  if ([string]::IsNullOrWhiteSpace($StateFilePath)) {
+    $stateFileName = ($targetCtx.ListIdentity -replace '[^A-Za-z0-9._-]', '_')
+    if ([string]::IsNullOrWhiteSpace($stateFileName)) {
+      $stateFileName = 'TargetList'
+    }
+    $StateFilePath = Join-Path $PSScriptRoot ("InfoPathMigrationState-{0}.json" -f $stateFileName)
+  }
+
   Start-RunLogging -Enabled $EnableLogging -Path $LogFilePath
   Write-RunConfigurationSummary -SourceContext $sourceCtx -TargetContext $targetCtx
 
@@ -1264,52 +1474,53 @@ try {
   Write-Info 'Connecting to source context...'
   Connect-ToPnPSite -Url $sourceCtx.SiteUrl
 
-  $source = Invoke-PnPWithRetry {
-    Get-PnPListItem -List $sourceCtx.ListIdentity -PageSize $PageSize -Fields @('FileRef', 'Attachments')
+  if (-not (Test-Path -Path $TempFolder -PathType Container)) {
+    New-Item -Path $TempFolder -ItemType Directory -Force | Out-Null
   }
-
-  if ($MaxItems -gt 0) {
-    $source = $source | Select-Object -First $MaxItems
-  }
-
-  $script:stats.SourceItemsRead = @($source).Count
-  Write-Info "Source items to process: $($script:stats.SourceItemsRead)"
-
-  if ($script:stats.SourceItemsRead -eq 0) {
-    Write-Warn 'No source items found. Exiting.'
-    return
-  }
+  $stagingFolder = Join-Path $TempFolder ("run-{0}" -f ([guid]::NewGuid().ToString('N')))
+  New-Item -Path $stagingFolder -ItemType Directory -Force | Out-Null
 
   $migrationQueue = New-Object System.Collections.Generic.List[object]
+  $allXmlSchemaKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $allXmlRichTextKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $allLongTextKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $lastSourceId = 0
+  $sourceBatchNumber = 0
 
-  $readIndex = 0
-  foreach ($item in $source) {
-    $readIndex++
-    Write-Info "[Source $readIndex/$($script:stats.SourceItemsRead)] Source item ID $($item.Id)"
+  while ($true) {
+    $sourceBatchNumber++
+    $sourceBatch = @(Get-SourceItemBatch -ListTitle $sourceCtx.ListIdentity -AfterId $lastSourceId -BatchSize $BatchSize)
+    if ($sourceBatch.Count -eq 0) { break }
 
-    try {
-      $xmlText = Resolve-InfoPathXmlFromItem -Item $item -ListTitle $sourceCtx.ListIdentity
-      if ([string]::IsNullOrWhiteSpace($xmlText)) {
-        $script:stats.Skipped++
-        Write-Warn "  Skipped: no InfoPath XML found for source item $($item.Id)."
-        continue
+    foreach ($item in $sourceBatch) {
+      $lastSourceId = [int]$item.Id
+      if ($MaxItems -gt 0 -and $script:stats.SourceItemsRead -ge $MaxItems) { break }
+      $script:stats.SourceItemsRead++
+      Write-Info "[Source $($script:stats.SourceItemsRead)] Source item ID $($item.Id) (batch $sourceBatchNumber)"
+
+      try {
+        $xmlText = Resolve-InfoPathXmlFromItem -Item $item -ListTitle $sourceCtx.ListIdentity
+        if ([string]::IsNullOrWhiteSpace($xmlText)) {
+          $script:stats.Skipped++
+          Write-Warn "  Skipped: no InfoPath XML found for source item $($item.Id)."
+          continue
+        }
+
+        $xmlPath = Join-Path $stagingFolder ("source-{0}.xml" -f $item.Id)
+        [IO.File]::WriteAllText($xmlPath, $xmlText.Replace('§', ''), [Text.Encoding]::UTF8)
+        $migrationQueue.Add([pscustomobject]@{ SourceId = [int]$item.Id; XmlPath = $xmlPath })
+        $script:stats.XmlResolved++
       }
-
-      $cleanXml = $xmlText.Replace('§', '')
-      [xml]$xmlDoc = $cleanXml
-      $script:stats.XmlResolved++
-
-      $migrationQueue.Add([pscustomobject]@{
-        SourceId = $item.Id
-        XmlDoc = $xmlDoc
-      })
+      catch {
+        $script:stats.Failed++
+        Write-Err "  Failed reading source item $($item.Id): $($_.Exception.Message)"
+      }
     }
-    catch {
-      $script:stats.Failed++
-      Write-Err "  Failed reading source item $($item.Id): $($_.Exception.Message)"
-    }
+
+    if (($MaxItems -gt 0 -and $script:stats.SourceItemsRead -ge $MaxItems) -or $sourceBatch.Count -lt $BatchSize) { break }
   }
 
+  Write-Info "Source items to process: $($script:stats.SourceItemsRead)"
   if ($migrationQueue.Count -eq 0) {
     Write-Warn 'No valid XML payloads were resolved from source. Exiting.'
     return
@@ -1321,24 +1532,24 @@ try {
   $allTargetFields = @(Invoke-PnPWithRetry { Get-PnPField -List $targetCtx.ListIdentity })
   $targetFields = @(Get-TargetWritableFields -ListTitle $targetCtx.ListIdentity)
   Write-Info "Writable target fields discovered: $($targetFields.Count)"
+  $migrationState = Load-MigrationState -Path $StateFilePath -SourceSite $sourceCtx.SiteUrl -SourceList $sourceCtx.ListIdentity -TargetSite $targetCtx.SiteUrl -TargetList $targetCtx.ListIdentity
 
-  $allXmlSchemaKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  $allXmlRichTextKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($work in $migrationQueue) {
-    $xmlMapForItem = Convert-InfoPathXmlToFieldMap -XmlDoc $work.XmlDoc
-    Add-Member -InputObject $work -MemberType NoteProperty -Name XmlMap -Value $xmlMapForItem -Force
-    foreach ($k in (Get-InfoPathXmlMetadataKeys -XmlDoc $work.XmlDoc)) {
-      $null = $allXmlSchemaKeys.Add([string]$k)
+    [xml]$xmlDoc = [IO.File]::ReadAllText($work.XmlPath)
+    $xmlMapForItem = Convert-InfoPathXmlToFieldMap -XmlDoc $xmlDoc
+    foreach ($k in (Get-InfoPathXmlMetadataKeys -XmlDoc $xmlDoc)) { $null = $allXmlSchemaKeys.Add([string]$k) }
+    foreach ($k in (Get-InfoPathXmlRichTextKeys -XmlDoc $xmlDoc)) { $null = $allXmlRichTextKeys.Add([string]$k) }
+    foreach ($entry in $xmlMapForItem.GetEnumerator()) {
+      if (-not $allXmlRichTextKeys.Contains([string]$entry.Key) -and [string]$entry.Value -and ([string]$entry.Value).Length -gt 255) { $null = $allLongTextKeys.Add([string]$entry.Key) }
     }
-    foreach ($k in (Get-InfoPathXmlRichTextKeys -XmlDoc $work.XmlDoc)) {
-      $null = $allXmlRichTextKeys.Add([string]$k)
-    }
+    $xmlDoc = $null
   }
 
   Write-Info "CreateMetadata is set to: $CreateMetadata"
   Write-Info "Duplicate mode is set to: $Duplicate"
   Write-Info "InfoPath XML schema fields discovered: $($allXmlSchemaKeys.Count)"
-  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -AllTargetFields $allTargetFields -RichTextKeys @($allXmlRichTextKeys) -CreateMetadata $CreateMetadata
+  Assert-TargetSchemaCompatibility -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -RichTextKeys @($allXmlRichTextKeys) -LongTextKeys @($allLongTextKeys)
+  $schemaSync = Ensure-TargetFieldsForXmlKeys -ListTitle $targetCtx.ListIdentity -XmlKeys @($allXmlSchemaKeys) -TargetFields $targetFields -AllTargetFields $allTargetFields -RichTextKeys @($allXmlRichTextKeys) -LongTextKeys @($allLongTextKeys) -CreateMetadata $CreateMetadata
   $targetFields = $schemaSync.TargetFields
   $targetFieldMap = $schemaSync.FieldMap
 
@@ -1351,24 +1562,19 @@ try {
   }
 
   $allSignatureFieldNames = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($work in $migrationQueue) {
-    $valuesForItem = New-TargetItemValues -XmlMap $work.XmlMap -FieldNameMap $targetFieldMap -FieldByInternalName $targetFieldByInternalName -SourceItem ([pscustomobject]@{ Id = $work.SourceId })
-    Add-Member -InputObject $work -MemberType NoteProperty -Name Values -Value $valuesForItem -Force
-
-    foreach ($fieldName in @($valuesForItem.Keys)) {
-      $null = $allSignatureFieldNames.Add([string]$fieldName)
+  foreach ($field in $targetFields) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$field.InternalName)) {
+      $null = $allSignatureFieldNames.Add([string]$field.InternalName)
     }
-
-    $sourceAttachments = @()
-    if (-not $SkipAttachments) {
-      $sourceAttachments = @(Get-InfoPathAttachmentsFromXml -XmlDoc $work.XmlDoc -BasicFileName $FallbackAttachmentName)
-    }
-    Add-Member -InputObject $work -MemberType NoteProperty -Name SourceAttachments -Value $sourceAttachments -Force
   }
 
   $targetDuplicateIndex = $null
   if ($Duplicate -ne 'CreateNew') {
-    if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+    if ($DuplicateDetection -eq 'SourceItemKey') {
+      Write-Info "Loaded migration state entries: $($migrationState.Count)"
+      $targetDuplicateIndex = $migrationState
+    }
+    elseif ($DuplicateDetection -eq 'MetadataAndAttachments') {
       $includeAttachmentNames = -not $SkipAttachments
       Write-Info 'Building in-memory duplicate signature index (metadata + attachments)...'
       $targetDuplicateIndex = Get-TargetDuplicateSignatureIndex -ListTitle $targetCtx.ListIdentity -SignatureFieldNames @($allSignatureFieldNames) -PageSize $PageSize -IncludeAttachmentNames $includeAttachmentNames
@@ -1381,27 +1587,46 @@ try {
     }
   }
 
-  if (-not (Test-Path -Path $TempFolder -PathType Container)) {
-    New-Item -Path $TempFolder -ItemType Directory -Force | Out-Null
-  }
-
   $i = 0
   foreach ($work in $migrationQueue) {
     $i++
     Write-Info "[Target $i/$($migrationQueue.Count)] Source item ID $($work.SourceId)"
 
     try {
-      $values = $work.Values
-      $attachments = @($work.SourceAttachments)
+      [xml]$xmlDoc = [IO.File]::ReadAllText($work.XmlPath)
+      $xmlMapForItem = Convert-InfoPathXmlToFieldMap -XmlDoc $xmlDoc
+      $sourceKey = "{0}|{1}|{2}" -f $sourceCtx.SiteUrl, $sourceCtx.ListIdentity, $work.SourceId
+      $values = New-TargetItemValues -XmlMap $xmlMapForItem -FieldNameMap $targetFieldMap -FieldByInternalName $targetFieldByInternalName -SourceItem ([pscustomobject]@{ Id = $work.SourceId })
+      $attachments = @()
+      if (-not $SkipAttachments) {
+        $attachmentFolder = Join-Path $stagingFolder ("source-{0}" -f $work.SourceId)
+        $attachments = @(Get-InfoPathAttachmentsFromXml -XmlDoc $xmlDoc -BasicFileName $FallbackAttachmentName -OutputFolder $attachmentFolder)
+      }
 
       $newItem = $null
       $itemAction = 'Created'
       $existingItemId = $null
+      $itemToDeleteId = $null
       $titleValue = if ($values.ContainsKey('Title')) { [string]$values['Title'] } else { '' }
       $sourceDuplicateSignature = $null
+      $stateEntry = $null
 
       if ($Duplicate -ne 'CreateNew' -and $null -ne $targetDuplicateIndex) {
-        if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+        if ($DuplicateDetection -eq 'SourceItemKey') {
+          $sourceKey = "{0}|{1}|{2}" -f $sourceCtx.SiteUrl, $sourceCtx.ListIdentity, $work.SourceId
+          if ($targetDuplicateIndex.Items.ContainsKey($sourceKey)) {
+            $stateEntry = $targetDuplicateIndex.Items[$sourceKey]
+            $verifiedItem = Get-TargetItemById -ListTitle $targetCtx.ListIdentity -ItemId ([int]$stateEntry.TargetId)
+            if ($null -ne $verifiedItem) {
+              $existingItemId = [int]$stateEntry.TargetId
+              if ($stateEntry.Status -ne 'Completed') { $newItem = $verifiedItem }
+            }
+            else {
+              $targetDuplicateIndex.Items.Remove($sourceKey)
+            }
+          }
+        }
+        elseif ($DuplicateDetection -eq 'MetadataAndAttachments') {
           $attachmentNames = @($attachments | ForEach-Object { [string]$_.FileName })
           $sourceDuplicateSignature = New-DuplicateSignature -Values $values -AttachmentNames $attachmentNames
           if (-not [string]::IsNullOrWhiteSpace($sourceDuplicateSignature) -and $targetDuplicateIndex.ContainsKey($sourceDuplicateSignature)) {
@@ -1417,32 +1642,35 @@ try {
 
       if ($null -ne $existingItemId) {
         if ($Duplicate -eq 'Skip') {
-          $script:stats.Skipped++
+          if ($null -ne $newItem) {
+            Write-Warn "  Resuming incomplete migration for source item $($work.SourceId) using target item ID $existingItemId."
+          }
+          else {
+            $script:stats.Skipped++
           if ($DuplicateDetection -eq 'MetadataAndAttachments') {
             Write-Warn "  Skipped duplicate source item $($work.SourceId): metadata+attachment signature matched target item ID $existingItemId (Title '$titleValue')."
           }
           else {
             Write-Warn "  Skipped duplicate source item $($work.SourceId): target item with Title '$titleValue' already exists (ID $existingItemId)."
           }
-          continue
+            continue
+          }
         }
 
-        if ($Duplicate -eq 'Overwrite') {
+        if ($null -eq $newItem -and $Duplicate -eq 'Overwrite') {
           if (-not $PSCmdlet.ShouldProcess("Target list '$($targetCtx.ListIdentity)'", "Replace item ID $existingItemId from source ID $($work.SourceId)")) {
             continue
           }
 
-          Invoke-PnPWithRetry {
-            Remove-PnPListItem -List $targetCtx.ListIdentity -Identity $existingItemId -Force | Out-Null
-          }
-
-          $newItem = Invoke-PnPWithRetry {
-            Add-PnPListItem -List $targetCtx.ListIdentity -Values $values
-          }
+          $newItem = Add-PnPListItem -List $targetCtx.ListIdentity -Values $values -ErrorAction Stop
+          $itemToDeleteId = $existingItemId
           $script:stats.TargetItemsCreated++
 
           if ($null -ne $targetDuplicateIndex) {
-            if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+            if ($DuplicateDetection -eq 'SourceItemKey') {
+              $targetDuplicateIndex.Items[$sourceKey] = [ordered]@{ TargetId = [int]$newItem.Id; Status = 'Created'; AttachmentNames = @() }
+            }
+            elseif ($DuplicateDetection -eq 'MetadataAndAttachments') {
               if (-not [string]::IsNullOrWhiteSpace($sourceDuplicateSignature)) {
                 $targetDuplicateIndex[$sourceDuplicateSignature] = [int]$newItem.Id
               }
@@ -1463,14 +1691,15 @@ try {
           continue
         }
 
-        $newItem = Invoke-PnPWithRetry {
-          Add-PnPListItem -List $targetCtx.ListIdentity -Values $values
-        }
+        $newItem = Add-PnPListItem -List $targetCtx.ListIdentity -Values $values -ErrorAction Stop
         $script:stats.TargetItemsCreated++
 
         # Keep duplicate index current so duplicates within the same run are handled without extra queries.
         if ($Duplicate -ne 'CreateNew' -and $null -ne $targetDuplicateIndex) {
-          if ($DuplicateDetection -eq 'MetadataAndAttachments') {
+          if ($DuplicateDetection -eq 'SourceItemKey') {
+            $targetDuplicateIndex.Items[$sourceKey] = [ordered]@{ TargetId = [int]$newItem.Id; Status = 'Created'; AttachmentNames = @() }
+          }
+          elseif ($DuplicateDetection -eq 'MetadataAndAttachments') {
             if ([string]::IsNullOrWhiteSpace($sourceDuplicateSignature)) {
               $attachmentNames = @($attachments | ForEach-Object { [string]$_.FileName })
               $sourceDuplicateSignature = New-DuplicateSignature -Values $values -AttachmentNames $attachmentNames
@@ -1486,11 +1715,33 @@ try {
         }
       }
 
+      if ($DuplicateDetection -eq 'SourceItemKey' -and ($null -eq $stateEntry -or $stateEntry.Status -ne 'Completed')) {
+        $stateEntry = [ordered]@{ TargetId = [int]$newItem.Id; Status = 'Created'; AttachmentNames = @() }
+        $migrationState.Items[$sourceKey] = $stateEntry
+        Save-MigrationState -Path $StateFilePath -State $migrationState
+      }
+
       if (-not $SkipAttachments) {
         if ($attachments.Count -gt 0) {
           Add-ExtractedAttachmentsToItem -ListTitle $targetCtx.ListIdentity -ItemId $newItem.Id -Attachments $attachments -WorkingFolder $TempFolder -DuplicateMode $Duplicate
           Write-Log -Message "  Attachments uploaded: $($attachments.Count)" -Level SUCCESS
         }
+      }
+
+      if ($null -ne $itemToDeleteId) {
+        Invoke-PnPWithRetry {
+          Remove-PnPListItem -List $targetCtx.ListIdentity -Identity $itemToDeleteId -Force | Out-Null
+        }
+      }
+
+      if ($DuplicateDetection -eq 'SourceItemKey') {
+        $stateEntry = [ordered]@{
+          TargetId = [int]$newItem.Id
+          Status = 'Completed'
+          AttachmentNames = @($attachments | ForEach-Object { [string]$_.FileName })
+        }
+        $migrationState.Items[$sourceKey] = $stateEntry
+        Save-MigrationState -Path $StateFilePath -State $migrationState
       }
 
       if ($itemAction -eq 'Replaced') {
@@ -1507,6 +1758,12 @@ try {
     catch {
       $script:stats.Failed++
       Write-Err "  Failed source item $($work.SourceId): $($_.Exception.Message)"
+    }
+    finally {
+      $xmlDoc = $null
+      if (Test-Path -LiteralPath $work.XmlPath -PathType Leaf) { Remove-Item -LiteralPath $work.XmlPath -Force -ErrorAction SilentlyContinue }
+      $attachmentFolder = Join-Path $stagingFolder ("source-{0}" -f $work.SourceId)
+      if (Test-Path -LiteralPath $attachmentFolder -PathType Container) { Remove-Item -LiteralPath $attachmentFolder -Recurse -Force -ErrorAction SilentlyContinue }
     }
   }
 
@@ -1539,6 +1796,9 @@ finally {
   }
   Write-Log -Message "Run complete with status: $finalStatus (elapsed ${elapsedSec}s)" -Level $statusLevel
   Write-Log -Message ('=' * 92) -Level INFO
+  if ($null -ne $stagingFolder -and (Test-Path -LiteralPath $stagingFolder -PathType Container)) {
+    Remove-Item -LiteralPath $stagingFolder -Recurse -Force -ErrorAction SilentlyContinue
+  }
   try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
 }
 #endregion Main Execution
