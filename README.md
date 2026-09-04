@@ -4,18 +4,19 @@ Migrate legacy InfoPath XML records from a source SharePoint list/library into a
 
 Script file: `migrate-infopath-xml-to-list-pnp.ps1`
 
-This README reflects the current script behavior, including advanced duplicate detection, full-item replace mode, professional run logging, and large-run performance improvements.
+This README reflects the current script behavior, including source-key duplicate detection, external migration state, schema preflight validation, enhanced rich-text support, and large-run memory protections.
 
 ## What the Script Does
 
 1. Connects to source and target SharePoint contexts (can be different sites).
 2. Reads source items and resolves InfoPath XML payloads.
 3. Parses XML metadata from InfoPath namespace leaf nodes.
-4. Optionally auto-creates missing target columns (Text or rich multiple-line text type).
-5. Maps metadata into target field values with sanitization.
-6. Extracts embedded InfoPath attachments from base64 payloads.
-7. Handles duplicates via configurable action and detection strategy.
-8. Creates or replaces target items, uploads attachments, and logs a structured run summary.
+4. Reads all XML payloads before target item creation and derives the required target schema.
+5. Optionally auto-creates missing target columns as single-line Text, multiple-line Note, or enhanced rich text.
+6. Maps metadata into target field values with sanitization.
+7. Extracts embedded InfoPath attachments from base64 payloads.
+8. Handles duplicates via configurable action and detection strategy.
+9. Creates or replaces target items, uploads attachments, and logs a structured run summary.
 
 ## Major Features
 
@@ -23,13 +24,20 @@ This README reflects the current script behavior, including advanced duplicate d
 - Source/target input as list title, GUID, or full URL.
 - Cross-site migration support.
 - Duplicate actions: `Skip`, `Overwrite`, `CreateNew`.
+- Default duplicate detection: `SourceItemKey`.
 - Duplicate detection modes:
+  - `SourceItemKey` (source site, source list, and immutable source item ID stored in external state)
   - `Title`
   - `MetadataAndAttachments` (mapped metadata + attachment file names)
-- Overwrite behavior is full replacement (delete old item, create new item).
+- Overwrite behavior creates and populates the replacement before deleting the old item.
+- External, target-list-specific JSON state with source/target scope validation.
+- Resumable item state for incomplete migrations.
+- Preflight schema validation before target item creation.
+- Rich XML fields are created as enhanced rich text Note columns.
+- Plain values over 255 characters are created as multiple-line Note columns.
 - Detailed start and end summary blocks in console and log file.
 - Robust retry logic for throttling and transient failures.
-- Optimized indexing for larger lists (in-memory duplicate indexes).
+- Bounded source retrieval and disk-backed XML/attachment staging for large runs.
 
 ## Prerequisites
 
@@ -77,11 +85,14 @@ The script supports InfoPath XML from:
 ### Processing Controls
 
 - `PageSize` (int, default `200`)
+- `BatchSize` (int, default `100`)
 - `MaxItems` (int, default `0`, meaning all)
 - `TempFolder` (string)
 - `FallbackAttachmentName` (string)
+- `StateFilePath` (string)
+  - Optional external JSON state file. By default, the script creates `InfoPathMigrationState-<target-list>.json`.
 - `CreateMetadata` (bool)
-  - `true`: create missing target columns. InfoPath XHTML fields become rich multiple-line text; other fields become single-line text.
+  - `true`: create missing target columns based on the complete XML scan. XHTML fields become enhanced rich text; plain fields over 255 characters become multiple-line Note fields; other fields become single-line Text.
   - `false`: do not create missing columns, unmapped fields are skipped.
 - `SkipAttachments` (switch)
   - If set, no attachment upload is attempted.
@@ -92,7 +103,8 @@ The script supports InfoPath XML from:
   - `Skip`: do nothing when a match is found.
   - `Overwrite`: replace matched item by deleting old and creating new.
   - `CreateNew`: always create a new item.
-- `DuplicateDetection` (`Title` | `MetadataAndAttachments`)
+- `DuplicateDetection` (`SourceItemKey` | `Title` | `MetadataAndAttachments`)
+  - `SourceItemKey`: default. Uses the normalized source site, source list, and immutable source item ID in the external state file. Safe when titles repeat.
   - `Title`: matches by `Title` only.
   - `MetadataAndAttachments`: matches by a generated signature from mapped metadata fields and attachment file names.
 
@@ -118,9 +130,21 @@ The script supports InfoPath XML from:
 
 - Finds a match using `DuplicateDetection`.
 - Replaces whole list item, not just attachments:
-  - remove existing target item
   - create new target item from source metadata
   - upload source attachments
+  - remove existing target item only after the replacement is complete
+
+### External Migration State
+
+When `DuplicateDetection` is `SourceItemKey`, the script does not add a tracking column or tracking value to the target list. It stores mappings in an external JSON file containing:
+
+- Source site and list identity
+- Target site and list identity
+- Source key to target item ID
+- Item status (`Created` or `Completed`)
+- Attachment names recorded at completion
+
+State entries are validated against the current source and target. A recorded target item is re-queried before it is skipped; stale entries are not trusted.
 
 ## Logging and Run Output
 
@@ -136,8 +160,12 @@ If enabled, the same entries are written to `LogFilePath`.
 
 For large lists (thousands of items), the script improves performance by:
 
-- Building an in-memory duplicate index once per run.
-- Precomputing source mapped values and attachments before target writes.
+- Retrieving source items in bounded ID-ordered batches.
+- Staging XML payloads and attachments on disk instead of retaining attachment bytes for the full run.
+- Parsing and importing one item at a time after the schema is known.
+- Keeping the in-memory work queue to source IDs and staged XML paths.
+
+The script intentionally reads and stages all source XML payloads before creating target items. This allows it to determine the complete target schema first while avoiding retention of XML DOMs and attachment byte arrays across the migration.
 
 When using `MetadataAndAttachments`, index creation is heavier than title mode because it reads target attachment names.
 
@@ -168,15 +196,15 @@ Retry wait uses:
   -CertStore LocalMachine
 ```
 
-### Advanced Duplicate Detection + Skip
+### Source-Key Duplicate Detection + Skip
 
 ```powershell
 .\migrate-infopath-xml-to-list-pnp.ps1 `
   -Duplicate Skip `
-  -DuplicateDetection MetadataAndAttachments
+  -DuplicateDetection SourceItemKey
 ```
 
-### Advanced Duplicate Detection + Overwrite (Full Replace)
+### Metadata Duplicate Detection + Overwrite (Full Replace)
 
 ```powershell
 .\migrate-infopath-xml-to-list-pnp.ps1 `
@@ -204,10 +232,11 @@ Retry wait uses:
 
 ## Important Implementation Notes
 
-- InfoPath fields containing XHTML are migrated to rich multiple-line text (`Note`) columns with their HTML preserved.
+- InfoPath fields containing XHTML are migrated to enhanced rich text (`Note`) columns with `RichText=TRUE` and `RichTextMode=FullHtml`.
 - Other auto-created metadata columns use single-line text.
+- Plain-text fields whose source values exceed 255 characters are created as multiple-line Note columns.
 - Text values are sanitized for control characters.
-- Single-line text fields are flattened and truncated to 255 chars.
+- Existing incompatible target columns are reported during preflight and stop the run before target items are written.
 - Attachment duplicate matching in `MetadataAndAttachments` uses attachment file names, not file content hashes.
 
 ## Troubleshooting
@@ -218,7 +247,7 @@ Expected when source library contains non-XML artifacts.
 
 ### Invalid text value errors
 
-Some fields may require custom transforms (date/choice/boolean/lookup). Extend mapping logic as needed.
+The script performs schema preflight before writing target items. If an existing target column is incompatible with the XML-derived requirement, correct the column type or use a new target list, then rerun. The script does not silently truncate or omit the incompatible value.
 
 ### Duplicate matching appears too broad or too narrow
 
@@ -239,10 +268,9 @@ Some fields may require custom transforms (date/choice/boolean/lookup). Extend m
 
 1. Start with `-MaxItems 20` in a test target list.
 2. Confirm metadata mappings and attachment outcomes.
-3. Choose duplicate strategy for production:
-   - Fast: `Title`
-   - Safer for repeated titles: `MetadataAndAttachments`
-4. Run full migration in monitored batches.
+3. Use the default `SourceItemKey` duplicate strategy for production. It is safe when titles repeat and does not modify the target list schema.
+4. Keep the generated target-specific state JSON file for reruns and back it up.
+5. Run the full migration with an appropriate `BatchSize` for the available memory.
 
 ## Repository Contents
 
